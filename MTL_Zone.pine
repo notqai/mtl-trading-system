@@ -1,0 +1,1925 @@
+//@version=6
+indicator("MTL Zone", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=1000)
+
+// ═══════════════════════════════════════════════════════════════
+// COLORS
+// ═══════════════════════════════════════════════════════════════
+C_BULL    = #00C853
+C_BEAR    = #7f0000
+C_NEUTRAL = #546e7a
+C_GOLD    = #ffd700
+C_WHITE   = color.white
+C_BLACK   = color.black
+cleanMode = input.bool(false, "Clean Mode (zones only, no labels)", group="🎨 Zone Colors")
+
+// ═══════════════════════════════════════════════════════════════
+// PINECONNECTOR ALERTS  [FIX #1: removed duplicate grpPC block; kept only one]
+// ═══════════════════════════════════════════════════════════════
+grpPC       = "📡 PineConnector Alerts"
+pcEnabled   = input.bool(true,   "Enable Alerts",       group=grpPC)
+pcLicenseID = input.string("8832727941333", "License ID", group=grpPC)  // [FIX #2: removed duplicate pcLicenseID declaration]
+pcSymbol    = input.string("XAUUSD",        "Symbol",     group=grpPC)
+pcVolume    = input.string("0.01",          "Volume",     group=grpPC)
+pcSLMult    = input.float(1.5, "SL (× ATR)", minval=0.5, maxval=5.0, step=0.1, group=grpPC)
+pcTPMult    = input.float(2.0, "TP (× ATR)", minval=0.5, maxval=10.0, step=0.1, group=grpPC)
+
+// ═══════════════════════════════════════════════════════════════
+// INSTRUMENT PROFILE
+// ═══════════════════════════════════════════════════════════════
+grpInstr = "🌐 Instrument Profile"
+instrPreset = input.string("Gold (Commodities)", "Instrument Preset",
+     options=["Auto","ES/NQ (Futures)","BTC/ETH (Crypto)","Gold (Commodities)","Forex (Majors)","Stocks (Mid-Cap)","Custom"],
+     tooltip="Scales all point-based filters to match the instrument.", group=grpInstr)
+customPtScale = input.float(1.0, "Custom Point Scale (× ES baseline)", minval=0.001, maxval=100000.0, step=0.1, group=grpInstr)
+atrOnlyMode   = input.bool(false, "ATR-Only Mode (ignore all point filters)", group=grpInstr)
+showInstrInfo = input.bool(false, "Show Instrument Info Label", group=grpInstr)
+
+_autoScale =
+     syminfo.basecurrency == "BTC"            ? 1000.0 :
+     syminfo.basecurrency == "ETH"            ? 80.0   :
+     syminfo.type         == "crypto"         ? 500.0  :
+     syminfo.type         == "forex"          ? 0.01   :
+     syminfo.currency     == "JPY"            ? 1.3    :
+     str.contains(syminfo.tickerid, "GC")     ? 10.0   :
+     str.contains(syminfo.tickerid, "CL")     ? 5.0    :
+     str.contains(syminfo.tickerid, "XAUUSD") ? 10.0   :
+     str.contains(syminfo.tickerid, "XAGUSD") ? 0.5    :
+     syminfo.type == "stock"                  ? 0.5    : 1.0
+
+ptScale =
+     instrPreset == "ES/NQ (Futures)"    ? 1.0    :
+     instrPreset == "BTC/ETH (Crypto)"   ? 1000.0 :
+     instrPreset == "Gold (Commodities)" ? 10.0   :
+     instrPreset == "Forex (Majors)"     ? 0.01   :
+     instrPreset == "Stocks (Mid-Cap)"   ? 0.5    :
+     instrPreset == "Custom"             ? customPtScale : _autoScale
+
+// ═══════════════════════════════════════════════════════════════
+// STRUCTURE
+// ═══════════════════════════════════════════════════════════════
+swingLen         = input.int(10,    "Swing Lookback",              minval=2,  group="⚙️ Structure")
+swingMaxAge      = input.int(75,    "Swing Max Age (bars)",        minval=10, group="⚙️ Structure")
+zoneExtend       = input.int(200,   "Zone Extension (bars)",       minval=1,  group="⚙️ Structure")
+obMitigation     = input.string("Close","OB Mitigated When",      options=["Close","Wick"], group="⚙️ Structure")
+minBodyPct       = input.float(10,  "Min OB Body % of Range",      minval=0, maxval=100, step=5, group="⚙️ Structure")
+minOBSize        = input.float(0.3, "Min OB Size (pts) @ 15m",     minval=0, step=0.1, group="⚙️ Structure")
+maxOBSize        = input.float(20.0,"Max OB Size (pts) @ 15m",     minval=1, step=0.5, group="⚙️ Structure")
+atrLen           = input.int(14,    "ATR Length",                  minval=5, maxval=50, group="⚙️ Structure")
+minOBatrMult     = input.float(0.15,"Min OB Size (× ATR)",         minval=0.05, maxval=1.0,  step=0.05, group="⚙️ Structure")
+maxOBatrMult     = input.float(2.0, "Max OB Size (× ATR)",         minval=0.5,  maxval=5.0,  step=0.1,  group="⚙️ Structure")
+srProximityTicks = input.float(5.0, "S/R Proximity (ticks)",       minval=0.5, step=0.5, group="⚙️ Structure")
+
+// ═══════════════════════════════════════════════════════════════
+// PIVOTS
+// ═══════════════════════════════════════════════════════════════
+grpPivots  = "📌 Pivots & Key Level"
+showPivots   = input.bool(true, "Show Pivot Levels (R1-R2 / S1-S2)", group=grpPivots)
+showKeyLevel = input.bool(true, "Show Key Level (PP)",               group=grpPivots)
+ePivot       = input.color(#ffd700, "Pivot Color",                   group=grpPivots)
+
+// ═══════════════════════════════════════════════════════════════
+// QZONE SYSTEM
+// ═══════════════════════════════════════════════════════════════
+grpQZ = "📍 QZone System"
+showQZones     = input.bool(true,  "Show QZones",                       group=grpQZ)
+qShowM1        = input.bool(true,  "M1",  group=grpQZ, inline="qtf1")
+qShowM5        = input.bool(true,  "M5",  group=grpQZ, inline="qtf1")
+qShowM15       = input.bool(true,  "M15", group=grpQZ, inline="qtf2")
+qShowM30       = input.bool(true,  "M30", group=grpQZ, inline="qtf2")
+qShowH1        = input.bool(true,  "H1",  group=grpQZ, inline="qtf3")
+qShowH4        = input.bool(true,  "H4",  group=grpQZ, inline="qtf3")
+qSwingLen      = input.int(3,      "Q Swing Lookback",                  minval=1, maxval=10, group=grpQZ)
+qUseBodyOnly   = input.bool(true,  "Body-Only Zones",                   group=grpQZ)
+qMinZoneHeight = input.float(3.0,  "Min Zone Height (pts @ M15)",       minval=0.5, maxval=20.0, step=0.5, group=grpQZ)
+qMinSwingAtr   = input.float(0.0,  "Min Swing Leg (× ATR)",             minval=0.0, maxval=3.0, step=0.05, group=grpQZ)
+qMinBars       = input.int(0,      "Min Bars Between Swings",           minval=0, maxval=20, group=grpQZ)
+qMergeRadius   = input.float(0.05, "Merge Radius (× ATR)",              minval=0.0, maxval=1.0, step=0.05, group=grpQZ)
+qMergeWindow   = input.int(5,      "Merge Window (bars)",                minval=1, maxval=50, group=grpQZ)
+qMaxZones      = input.int(15,     "Max QZones Per Side",                minval=5, maxval=100, group=grpQZ)
+qShowLabel     = input.bool(true,  "Show QZone Labels",                 group=grpQZ)
+qDeleteOnBreak = input.bool(true,  "Delete Zone on Close Through",      group=grpQZ)
+qLabelOffset   = input.float(0.02, "Label Offset (× ATR)",              minval=0.0, maxval=0.5, step=0.01, group=grpQZ)
+qOppositeBlock = input.float(1.5,  "Block if Opposite Within (× ATR)", minval=0.0, maxval=5.0, step=0.25, group=grpQZ)
+minScoreToShow = input.int(2,      "Min Score to Show (1-3)",           minval=1, maxval=3, group=grpQZ)
+engAgeFade     = input.bool(true,  "Fade QZones with Age",              group=grpQZ)
+engFadeAfter   = input.int(50,     "Start Fading After (bars)",         minval=5, group=grpQZ)
+
+// ═══════════════════════════════════════════════════════════════
+// MZ Settings
+// ═══════════════════════════════════════════════════════════════
+grpMZ = "🔷 MZ (Market Zone) Settings"
+mzMinAtr       = input.float(0.15, "Min MZ Body Size (x ATR)",         minval=0.05, maxval=1.0,  step=0.05, group=grpMZ)
+mzMaxAtr       = input.float(2.5,  "Max MZ Body Size (x ATR)",         minval=0.5,  maxval=6.0,  step=0.1,  group=grpMZ)
+mzCloseExtreme = input.float(0.65, "Close in Extreme Fraction",        minval=0.4,  maxval=0.95, step=0.05, group=grpMZ)
+mzMinLeg       = input.float(1.0,  "Min Approach Leg (x ATR)",         minval=0.0,  maxval=5.0,  step=0.1,  group=grpMZ)
+mzRequireSR    = input.bool(false, "Only Create MZ Near S/R",          group=grpMZ)
+mzMinPrevBody  = input.float(0.30, "Min Prev Candle Body % of Range",  minval=0.10, maxval=0.80, step=0.05, group=grpMZ)
+mzMinCurrBody  = input.float(0.40, "Min Engulf Candle Body % of Range",minval=0.10, maxval=0.90, step=0.05, group=grpMZ)
+mzMinEngulfPct = input.float(1.20, "Min Engulf Ratio (curr/prev body)",minval=1.0,  maxval=3.0,  step=0.05, group=grpMZ)
+mzSwingProx    = input.float(1.5,  "Prior High/Low Proximity (x ATR)", minval=0.0,  maxval=5.0,  step=0.25, group=grpMZ)
+mzMinWick      = input.float(0.0,  "Min Prev Candle Wick Ratio",       minval=0.0,  maxval=1.0,  step=0.05, group=grpMZ)
+requireConfirm = input.bool(true,  "Require Confirmation Candle",      group=grpMZ)
+
+// ═══════════════════════════════════════════════════════════════
+// BASE ZONE Settings
+// ═══════════════════════════════════════════════════════════════
+grpBZ = "🟦 Base Zone (Consolidation)"
+showBaseZones = input.bool(false, "Show Base Zones",          group=grpBZ)
+bzMinBars     = input.int(6,      "Min Consolidation Bars",   minval=3,    maxval=30,  group=grpBZ)
+bzMaxRangeAtr = input.float(0.6,  "Max Base Range (x ATR)",   minval=0.1,  maxval=2.0, step=0.05, group=grpBZ)
+bzMinRangeAtr = input.float(0.05, "Min Base Range (x ATR)",   minval=0.01, maxval=0.5, step=0.01, group=grpBZ)
+bzBreakoutAtr = input.float(0.5,  "Breakout Impulse (x ATR)", minval=0.1,  maxval=3.0, step=0.1,  group=grpBZ)
+bzLookback    = input.int(25,     "Max Lookback (bars)",       minval=10,   maxval=100, group=grpBZ)
+
+// ═══════════════════════════════════════════════════════════════
+// ORDER BLOCK Settings
+// ═══════════════════════════════════════════════════════════════
+grpOB = "🔶 Order Block (CHoCH/BOS) Source"
+showOBZones      = input.bool(true,    "Show OB Zones",                   group=grpOB)
+obSwingLen       = input.int(3,        "OB Swing Length",                 minval=1,    maxval=20,  group=grpOB)
+obAtrLen         = input.int(14,       "OB ATR Length",                   minval=5,    maxval=50,  group=grpOB)
+obMinSwingLeg    = input.float(0.8,    "Min Swing Leg (x ATR)",           minval=0.0,  maxval=3.0, step=0.05, group=grpOB)
+obMinBars        = input.int(6,        "Min Bars Between Swings",         minval=0,    maxval=30,  group=grpOB)
+obBreakBuffer    = input.float(0.15,   "Break Buffer (x ATR)",            minval=0.0,  maxval=1.0, step=0.05, group=grpOB)
+obConfirmClose   = input.bool(true,    "Confirm Break with Close",        group=grpOB)
+obRequireDisp    = input.bool(true,    "Require Displacement Candle",     group=grpOB)
+obBodyDisp       = input.float(0.35,   "Body Displacement (x ATR)",       minval=0.05, maxval=2.0, step=0.05, group=grpOB)
+obCloseExtreme   = input.float(0.6,    "Close Fraction in Extreme",       minval=0.4,  maxval=0.95,step=0.05, group=grpOB)
+obMinBarsBetween = input.int(3,        "Min Bars Between OB Events",      minval=0,    maxval=20,  group=grpOB)
+obMergeRadius    = input.float(0.1,    "OB Merge Radius (x ATR)",         minval=0.0,  maxval=1.0, step=0.05, group=grpOB)
+obMergeWindow    = input.int(10,       "OB Merge Window (bars)",           minval=1,    maxval=50,  group=grpOB)
+obBullColor      = input.color(#1B5E20,"OB Bull Color",                   group=grpOB)
+obBearColor      = input.color(#c62828,"OB Bear Color",                   group=grpOB)
+obOpacity        = input.int(75,       "OB Opacity",                      minval=0,    maxval=99,  group=grpOB)
+showOBLabels     = input.bool(true,    "Show MTL Buy/Sell Labels",         group=grpOB)
+
+// ═══════════════════════════════════════════════════════════════
+// FEATURES
+// ═══════════════════════════════════════════════════════════════
+showFVG        = input.bool(true,  "Show Fair Value Gaps",        group="🏷️ Features")
+minFVGSize     = input.float(0.5,  "Min FVG Size (pts) @ 15m",   minval=0, step=0.1, group="🏷️ Features")
+maxFVGSize     = input.float(10.0, "Max FVG Size (pts) @ 15m",   minval=1, step=0.5, group="🏷️ Features")
+showConfluence = input.bool(false, "Show Zone + FVG Confluence",  group="🏷️ Features")
+showQLabels    = input.bool(true,  "Show MTL Buy/MTL Sell Labels",group="🏷️ Features")
+
+// ═══════════════════════════════════════════════════════════════
+// ZONE COLORS
+// ═══════════════════════════════════════════════════════════════
+grpColors = "🎨 Zone Colors"
+bullZoneColor   = input.color(#00C853, "Support Color",       group=grpColors)
+bearZoneColor   = input.color(#7f0000, "Resistance Color",    group=grpColors)
+bullZoneOpacity = input.int(78, "Support Opacity",    minval=0, maxval=99, group=grpColors)
+bearZoneOpacity = input.int(55, "Resistance Opacity", minval=0, maxval=99, group=grpColors)
+bullFVGColor    = input.color(#00e5ff, "Bull FVG Color",      group=grpColors)
+bearFVGColor    = input.color(#ff80f4, "Bear FVG Color",      group=grpColors)
+fvgOpacity      = input.int(70, "FVG Opacity",        minval=0, maxval=99, group=grpColors)
+fvgLabelColor   = input.color(color.white, "FVG Label Color", group=grpColors)
+confBorderColor = input.color(#00e5ff00, "Zone+FVG Confluence Border", group=grpColors)
+
+// ═══════════════════════════════════════════════════════════════
+// S/R
+// ═══════════════════════════════════════════════════════════════
+srConfColor = input.color(color.new(#ffd700, 30), "S/R Conf Color", group="📐 S/R")
+
+// ═══════════════════════════════════════════════════════════════
+// SIDEWAYS DETECTION
+// ═══════════════════════════════════════════════════════════════
+grpSW         = "↔️ Sideways Detection"
+showSideways  = input.bool(true,   "Show Sideways Market",             group=grpSW)
+swLookback    = input.int(50,      "Sideways Lookback (bars)",         minval=5,   maxval=200,  group=grpSW)
+swAtrMult     = input.float(6.0,   "Max Range to ATR (× ATR)",        minval=0.5, maxval=20.0, step=0.5,  group=grpSW)
+swSlopeThresh = input.float(0.10,  "Max LinReg Slope (× ATR)",        minval=0.01,maxval=2.0,  step=0.01, group=grpSW)
+swMinBars     = input.int(5,       "Min Bars Confirmed Sideways",     minval=3,   maxval=50,   group=grpSW)
+swLineColor   = input.color(#90a4ae, "Sideways Line Color",           group=grpSW)
+swLabelColor  = input.color(#90a4ae, "Sideways Label Color",          group=grpSW)
+swShowLines   = input.bool(true,   "Show Range Lines",                group=grpSW)
+swShowLabel   = input.bool(true,   "Show Label",                      group=grpSW)
+
+// ═══════════════════════════════════════════════════════════════
+// PINECONNECTOR SETTINGS  [FIX #1 cont.: merged into single block, no duplicate grpPC]
+// ═══════════════════════════════════════════════════════════════
+grpPCS       = "📡 PineConnector Settings"
+pcRisk       = input.float(1.0,  "Risk % per trade",                   minval=0.1, step=0.1, group=grpPCS)
+pcSLmult     = input.float(1.5,  "SL multiplier (× ATR)",              minval=0.5, step=0.1, group=grpPCS)
+pcTPmult     = input.float(2.5,  "TP multiplier (× ATR)",              minval=0.5, step=0.1, group=grpPCS)
+pcSpread     = input.float(0.0,  "Extra spread buffer (pts)",          minval=0.0, step=0.5, group=grpPCS)
+pcTrailATR   = input.bool(true,  "ATR Trailing SL",                   group=grpPCS)
+pcTrailPer   = input.int(14,     "Trail ATR Period",                   minval=5, maxval=50, group=grpPCS)
+pcTrailMult  = input.float(1.0,  "Trail ATR Multiplier",               minval=0.3, maxval=5.0, step=0.1, group=grpPCS)
+pcTrailTrig  = input.float(10.0, "Trail Trigger pips (0=immediate)",  minval=0.0, step=5.0, group=grpPCS)
+pcAlertQZ    = input.bool(true,  "Alert on QZone",                    group=grpPCS)
+pcAlertOB    = input.bool(true,  "Alert on OB Break",                 group=grpPCS)
+pcAlertMZ    = input.bool(true,  "Alert on MZ Engulf",                group=grpPCS)
+pcAlertFVG   = input.bool(true,  "Alert on FVG",                      group=grpPCS)
+pcFreq       = input.string("Once Per Bar Close", "Alert Frequency",
+     options=["Once Per Bar Close","Once Per Bar","All"], group=grpPCS)
+
+// ═══════════════════════════════════════════════════════════════
+// SIGNAL FILTER + HTF BIAS
+// ═══════════════════════════════════════════════════════════════
+grpTF          = "📈 Signal Filter"
+blockSideways  = input.bool(true,  "Block Signals in Sideways Market",  group=grpTF)
+blockOpposite  = input.bool(true,  "Block Contested Levels (buy+sell same bar)", group=grpTF,
+     tooltip="Blocks both signals if buy AND sell fire on the same bar. Soft filter — doesn't require multiple sources.")
+minSources     = input.int(1,      "Min Sources to Fire (1=any, 2=soft confluence)", minval=1, maxval=4, group=grpTF,
+     tooltip="1 = any single source fires freely. 2 = soft confluence, needs 2 sources same direction. Recommended: 1 or 2.")
+
+// ── HTF Bias ──────────────────────────────────────────────────
+useHTFBias     = input.bool(true,   "Enable HTF Bias",                   group=grpTF,
+     tooltip="Checks higher timeframe trend before firing. Soft = counter-trend trades fire at half risk. Strict = blocked.")
+htfTF          = input.string("60", "HTF Timeframe",
+     options=["15","30","60","240"],                                      group=grpTF,
+     tooltip="H1 (60) recommended for M1/M5 scalping. H4 (240) for M5/M15.")
+htfEMALen      = input.int(50,      "HTF EMA Length",  minval=10, maxval=200, group=grpTF)
+htfMode        = input.string("Soft","HTF Filter Mode",
+     options=["Soft","Strict"],                                           group=grpTF,
+     tooltip="Soft = allow counter-trend at half risk. Strict = only trade with HTF direction.")
+htfCounterRisk = input.float(0.5,   "Counter-Trend Risk % (Soft mode)",  minval=0.1, step=0.1, group=grpTF,
+     tooltip="Used when trade direction opposes HTF EMA. With-trend uses full pcRisk.")
+showHTFEMA     = input.bool(true,   "Show HTF EMA on Chart",              group=grpTF)
+
+// ═══════════════════════════════════════════════════════════════
+// PARTIAL CLOSE / BREAKEVEN
+// ═══════════════════════════════════════════════════════════════
+grpBE = "🔒 Partial Close & Breakeven"
+useBreakeven   = input.bool(true,   "Move SL to Breakeven",            group=grpBE)
+beTriggerMult  = input.float(0.5,   "BE Trigger (× SL distance)",      minval=0.3, maxval=3.0, step=0.1, group=grpBE)
+beStopPips     = input.float(10.0,  "BE Stop (pips above entry)",       minval=0.0, step=5.0, group=grpBE)
+usePartialClose = input.bool(true,  "Partial Close 50% at 1:1 RR",     group=grpBE)
+
+// ═══════════════════════════════════════════════════════════════
+// NEWS FILTER
+// ═══════════════════════════════════════════════════════════════
+grpNews = "📰 News Filter"
+useNewsFilter = input.bool(true, "Enable PineConnector News Filter",  group=grpNews)
+
+// ═══════════════════════════════════════════════════════════════
+// VOLUMETRIC ANALYSIS
+// ═══════════════════════════════════════════════════════════════
+grpVol      = "📊 Volumetric Analysis"
+showVolInfo = input.bool(false, "Show Buy/Sell Volume at Zones",   group=grpVol)
+volLookback = input.int(50,     "Volume Lookback (bars)",          minval=20, maxval=500, group=grpVol)
+volHighMult = input.float(1.5,  "High Vol Threshold (× avg → LOW RISK)",  minval=0.5, maxval=10.0, step=0.1, group=grpVol)
+volLowMult  = input.float(0.6,  "Low Vol Threshold (× avg → HIGH RISK)",  minval=0.1, maxval=5.0,  step=0.1, group=grpVol)
+volBarWidth = input.int(50,     "Vol Bar Width (bars)",                    minval=10,  maxval=200,             group=grpVol)
+
+// ═══════════════════════════════════════════════════════════════
+// MARTINGALE
+// ═══════════════════════════════════════════════════════════════
+grpMG          = "📈 Layered Scaling"
+useMartingale  = input.bool(true,   "Enable Layer Scaling",             group=grpMG,
+     tooltip="Adds positions as price moves toward SL, all sharing the same SL. Averages down before SL is hit.")
+mgMaxLevel     = input.int(3,       "Max Layers (excl. first entry)",   minval=1, maxval=5, group=grpMG,
+     tooltip="How many extra positions to add between entry and SL.")
+mgMultiplier   = input.float(1.0,   "Risk Multiplier per Layer",        minval=0.5, maxval=3.0, step=0.1, group=grpMG,
+     tooltip="1.0 = same size each layer. 1.5 = each layer 50% bigger than previous.")
+mgLayerSpacing = input.float(0.25,  "Layer Spacing (fraction of SL)",   minval=0.1, maxval=0.9, step=0.05, group=grpMG,
+     tooltip="0.25 = first layer at 25% of the way to SL, second at 50%, third at 75%.")
+mgResetOnFlip  = input.bool(true,   "Reset Layers on Direction Flip",   group=grpMG)
+
+// Signal flags
+var bool sig_qz_buy   = false
+var bool sig_qz_sell  = false
+var bool sig_ob_buy   = false
+var bool sig_ob_sell  = false
+var bool sig_mz_buy   = false
+var bool sig_mz_sell  = false
+var bool sig_fvg_buy  = false
+var bool sig_fvg_sell = false
+
+// Tracks which QZone source fired, so the relay can be told MZ vs Base vs QZone
+var string lastBuySrc  = ""
+var string lastSellSrc = ""
+
+// Layer scaling state
+var float mg_buy_entry   = na
+var float mg_buy_sl      = na
+var int   mg_buy_layers  = 0
+var float mg_sell_entry  = na
+var float mg_sell_sl     = na
+var int   mg_sell_layers = 0
+var bool  mg_last_was_buy  = false
+var bool  mg_last_was_sell = false
+var int   mg_buy_level  = 0
+var int   mg_sell_level = 0
+
+// ═══════════════════════════════════════════════════════════════
+// ATR + TIMEFRAME SCALING
+// ═══════════════════════════════════════════════════════════════
+atrValue  = ta.atr(atrLen)
+avgVol50  = ta.sma(volume, 50)
+_atrMinOB   = atrValue * minOBatrMult
+_atrMaxOB   = atrValue * maxOBatrMult
+_atrMrgRad  = atrValue * qMergeRadius
+_atrOppBlk  = atrValue * qOppositeBlock
+_atrLblOff  = atrValue * qLabelOffset
+_atrFVGMin  = atrValue * 0.05
+_atrQZMin   = atrValue * 0.03
+_atrMZMin   = atrValue * mzMinAtr
+_atrMZMax   = atrValue * mzMaxAtr
+_atrMZLeg   = atrValue * mzMinLeg
+_atrMZProx  = atrValue * mzSwingProx
+
+obAtrValue     = ta.atr(obAtrLen)
+_atrOBBreak    = obAtrValue * obBreakBuffer
+_atrOBBodyDisp = obAtrValue * obBodyDisp
+_atrOBMinLeg   = obAtrValue * obMinSwingLeg
+_atrOBMrgRad   = obAtrValue * obMergeRadius
+
+_pcPipMult = instrPreset == "Gold (Commodities)" ? 10.0 : 1.0
+_pcSLraw   = math.round(atrValue * pcSLmult * _pcPipMult, 1)
+_pcTPraw   = math.round(atrValue * pcTPmult * _pcPipMult, 1)
+_pcMinSL   = instrPreset == "Gold (Commodities)" ? 100.0 : 5.0
+_pcSL      = math.max(_pcSLraw, _pcMinSL)
+_pcTP      = math.max(_pcTPraw, _pcSL * (pcTPmult / pcSLmult))
+_beTrigger = math.round(_pcSL * beTriggerMult, 1)
+
+isM1TF  = timeframe.period == "1"
+isM5TF  = timeframe.period == "5"
+isM15TF = timeframe.period == "15"
+isM30TF = timeframe.period == "30"
+isH1TF  = timeframe.period == "60"
+isH4TF  = timeframe.period == "240"
+tfLabel = isM1TF ? "M1" : isM5TF ? "M5" : isM15TF ? "M15" : isM30TF ? "M30" : isH1TF ? "H1" : isH4TF ? "H4" : ""
+tfMins  = timeframe.in_seconds() / 60
+tfScale = tfMins <= 1 ? 0.15 : tfMins <= 5 ? 0.40 : tfMins <= 15 ? 1.00 : tfMins <= 30 ? 1.50 : tfMins <= 60 ? 2.20 : tfMins <= 240 ? 3.50 : 5.00
+
+isGoldPreset  = instrPreset == "Gold (Commodities)"
+combinedScale = isGoldPreset ? tfScale : tfScale * ptScale
+
+effMinBodyPct  = minBodyPct + (tfMins >= 60 ? 20.0 : tfMins >= 30 ? 10.0 : 0.0)
+autoMinFVG     = atrOnlyMode ? 0.0      : minFVGSize * combinedScale
+autoMaxFVG     = atrOnlyMode ? 999999.0 : maxFVGSize * combinedScale
+effMinOBPts    = atrOnlyMode ? 0.0      : minOBSize      * combinedScale
+effMaxOBPts    = atrOnlyMode ? 999999.0 : maxOBSize      * combinedScale
+effMinZoneHt   = atrOnlyMode ? 0.0      : qMinZoneHeight * combinedScale
+effFadeAfter   = math.max(5, math.round(engFadeAfter / tfScale))
+
+isLowTF        = isM1TF or isM5TF
+effMinScore    = isM1TF ? 2 : isM5TF ? 1 : minScoreToShow
+effMinZoneHtM1 = isM1TF ? effMinZoneHt * 5.0 : isM5TF ? effMinZoneHt * 1.2 : effMinZoneHt
+effMaxZonesM1  = isM1TF ? math.min(qMaxZones, 5) : isM5TF ? math.min(qMaxZones, 10) : qMaxZones
+effMergRadM1   = isM1TF ? _atrMrgRad * 4.0 : isM5TF ? _atrMrgRad * 1.0 : _atrMrgRad
+effMinBarsM1   = isM1TF ? math.max(qMinBars, 15) : isM5TF ? math.max(qMinBars, 8) : qMinBars
+effQSwingLen   = isM1TF ? math.max(qSwingLen, 10) : isM5TF ? math.max(qSwingLen, 6) : qSwingLen
+effMinSwingLeg = isM1TF ? atrValue * 1.5 : isM5TF ? atrValue * 1.0 : atrValue * qMinSwingAtr
+
+mzLabelMinDist = isGoldPreset ? 4.0 : atrValue * 0.02
+
+qTFActive = showQZones and tfLabel != "" and
+     ((isM1TF and qShowM1) or (isM5TF and qShowM5) or (isM15TF and qShowM15) or
+      (isM30TF and qShowM30) or (isH1TF and qShowH1) or (isH4TF and qShowH4))
+
+eBullFVG = color.new(bullFVGColor, fvgOpacity)
+eBearFVG = color.new(bearFVGColor, fvgOpacity)
+
+bzThrottle   = isM1TF ? 5 : isM5TF ? 3 : isM15TF ? 2 : 1
+bzRunThisBar = (bar_index % bzThrottle) == 0
+swThrottle   = isM1TF ? 5 : isM5TF ? 3 : 1
+swRunThisBar = (bar_index % swThrottle) == 0
+
+max_bars_back(open,   1000)
+max_bars_back(high,   1000)
+max_bars_back(low,    1000)
+max_bars_back(close,  1000)
+max_bars_back(time,   1000)
+max_bars_back(volume, 1000)
+
+// Signal resets
+sig_qz_buy   := false
+sig_qz_sell  := false
+sig_ob_buy   := false
+sig_ob_sell  := false
+sig_mz_buy   := false
+sig_mz_sell  := false
+sig_fvg_buy  := false
+sig_fvg_sell := false
+lastBuySrc   := ""
+lastSellSrc  := ""
+
+// ── HTF Bias EMA ─────────────────────────────────────────────
+htfEMA      = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfEMALen), lookahead=barmerge.lookahead_off)
+htfBullBias = close > htfEMA
+htfBearBias = close < htfEMA
+
+trendBuyOK  = not useHTFBias or htfMode == "Soft" or htfBullBias
+trendSellOK = not useHTFBias or htfMode == "Soft" or htfBearBias
+
+plot(showHTFEMA and useHTFBias ? htfEMA : na, "HTF EMA",
+     color     = htfBullBias ? color.new(#00e676, 15) : color.new(#ff1744, 15),
+     linewidth = 2)
+
+// ═══════════════════════════════════════════════════════════════
+// INSTRUMENT INFO LABEL
+// ═══════════════════════════════════════════════════════════════
+var label instrInfoLabel = na
+if showInstrInfo and barstate.islast
+    label.delete(instrInfoLabel)
+    _modeStr  = atrOnlyMode ? " │ ATR-Only" : ""
+    _scaleStr = "×" + str.tostring(math.round(ptScale, 3))
+    instrInfoLabel := label.new(bar_index + 5, high,
+         "MTL Zone │ " + instrPreset + " │ Scale " + _scaleStr + _modeStr,
+         style=label.style_label_left, color=color.new(C_NEUTRAL, 70),
+         textcolor=color.new(C_WHITE, 20), size=size.small)
+
+// ═══════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════
+f_atrZoneOK(zoneSize) =>
+    atrOK = zoneSize >= _atrMinOB and zoneSize <= _atrMaxOB
+    ptsOK = atrOnlyMode or (zoneSize >= effMinOBPts and zoneSize <= effMaxOBPts)
+    atrOK and ptsOK
+
+f_fireMZBuy(ql, yBot) =>
+    label.set_x(ql, bar_index)
+    label.set_y(ql, yBot - _atrLblOff)
+    label.set_text(ql, cleanMode ? "" : "✦ MTL Buy")
+    label.set_color(ql, C_BULL)
+    label.set_textcolor(ql, C_WHITE)
+    label.set_style(ql, cleanMode ? label.style_none : label.style_label_up)
+    label.set_size(ql, size.small)
+
+f_fireMZSell(ql, yTop) =>
+    label.set_x(ql, bar_index)
+    label.set_y(ql, yTop + _atrLblOff)
+    label.set_text(ql, cleanMode ? "" : "✦ MTL Sell")
+    label.set_color(ql, C_BEAR)
+    label.set_textcolor(ql, C_WHITE)
+    label.set_style(ql, cleanMode ? label.style_none : label.style_label_down)
+    label.set_size(ql, size.small)
+
+
+
+// ── Volumetric helpers ───────────────────────────────────────
+f_fmtVol(v) =>
+    res = str.tostring(math.round(v, 0))
+    if v >= 1000000.0
+        res := str.tostring(math.round(v / 1000000.0, 1)) + "M"
+    else if v >= 1000.0
+        res := str.tostring(math.round(v / 1000.0, 0)) + "K"
+    res
+
+f_zoneVol(zH, zL) =>
+    bv  = 0.0
+    sv  = 0.0
+    cnt = 0
+    lb  = math.min(bar_index, volLookback)
+    for k = 0 to lb
+        if high[k] >= zL and low[k] <= zH
+            rng  = high[k] - low[k]
+            v    = volume[k]
+            frac = rng > 0.0 ? (close[k] - low[k]) / rng : 0.5
+            bv  += v * frac
+            sv  += v * (1.0 - frac)
+            cnt += 1
+    [bv, sv, cnt]
+
+f_volRisk(bv, sv, cnt) =>
+    total     = bv + sv
+    avgAtZone = cnt > 0 ? total / cnt : 0.0
+    ratio     = avgVol50 > 0.0 ? avgAtZone / avgVol50 : 0.0
+    ratio >= volHighMult ? "LOW RISK" : ratio >= volLowMult ? "MED RISK" : "HIGH RISK"
+
+f_buildVolLbl(bv, sv, cnt) =>
+    risk     = f_volRisk(bv, sv, cnt)
+    riskIcon = risk == "LOW RISK" ? "▲" : risk == "MED RISK" ? "◆" : "▼"
+    bStr     = f_fmtVol(bv)
+    sStr     = f_fmtVol(sv)
+    "B:" + bStr + "  S:" + sStr + "\n" + riskIcon + " " + risk
+
+// ═══════════════════════════════════════════════════════════════
+// SWING DETECTION
+// ═══════════════════════════════════════════════════════════════
+swingHigh = ta.pivothigh(high, swingLen, swingLen)
+swingLow  = ta.pivotlow (low,  swingLen, swingLen)
+var float lastSH = na, var float lastSL = na
+var int lastSHBar = na, var int lastSLBar = na
+
+if not na(swingHigh)
+    lastSH := swingHigh, lastSHBar := bar_index - swingLen
+if not na(swingLow)
+    lastSL := swingLow,  lastSLBar := bar_index - swingLen
+
+var float[] srHighs = array.new<float>()
+var float[] srLows  = array.new<float>()
+
+if not na(swingHigh)
+    array.unshift(srHighs, swingHigh)
+    if array.size(srHighs) > 10
+        array.pop(srHighs)
+if not na(swingLow)
+    array.unshift(srLows, swingLow)
+    if array.size(srLows) > 10
+        array.pop(srLows)
+
+// ═══════════════════════════════════════════════════════════════
+// FAIR VALUE GAPS
+// ═══════════════════════════════════════════════════════════════
+bullFVGSize = low   - high[2]
+bearFVGSize = low[2] - high
+bullFVG = showFVG and barstate.isconfirmed and low > high[2] and high[1] > high[2] and low[1] < low  and bullFVGSize >= autoMinFVG and bullFVGSize <= autoMaxFVG and bullFVGSize >= _atrFVGMin
+bearFVG = showFVG and barstate.isconfirmed and high < low[2] and low[1] < low[2]  and high[1] > high and bearFVGSize >= autoMinFVG and bearFVGSize <= autoMaxFVG and bearFVGSize >= _atrFVGMin
+
+var bool newBullFVGThisBar = false
+var bool newBearFVGThisBar = false
+newBullFVGThisBar := bullFVG
+newBearFVGThisBar := bearFVG
+
+var box[]   bullFVGBoxes   = array.new<box>()
+var float[] bullFVGTops    = array.new<float>()
+var float[] bullFVGBots    = array.new<float>()
+var label[] bullFVGLbls    = array.new<label>()
+var bool[]  bullFVGInZone  = array.new<bool>()
+var bool[]  bullFVGFired   = array.new<bool>()
+var int[]   bullFVGCreatedBar = array.new<int>()   // [FIX #3: retest-only fire]
+var box[]   bearFVGBoxes   = array.new<box>()
+var float[] bearFVGTops    = array.new<float>()
+var float[] bearFVGBots    = array.new<float>()
+var label[] bearFVGLbls    = array.new<label>()
+var bool[]  bearFVGInZone  = array.new<bool>()
+var bool[]  bearFVGFired   = array.new<bool>()
+var int[]   bearFVGCreatedBar = array.new<int>()   // [FIX #3: retest-only fire]
+
+if bullFVG
+    fTop = low, fBot = high[2]
+    array.unshift(bullFVGBoxes, box.new(bar_index-2, fTop, bar_index+zoneExtend, fBot, bgcolor=eBullFVG, border_color=color.new(bullFVGColor,55), border_width=1))
+    array.unshift(bullFVGTops, fTop), array.unshift(bullFVGBots, fBot)
+    array.unshift(bullFVGLbls, label.new(bar_index+15, (fTop+fBot)/2, "G Setup Buy", style=label.style_none, color=color.new(bullFVGColor,100), textcolor=color.white, size=size.tiny))
+    array.unshift(bullFVGInZone, false), array.unshift(bullFVGFired, false)
+    array.unshift(bullFVGCreatedBar, bar_index)   // [FIX #3]
+    if array.size(bullFVGBoxes) > 5
+        box.delete(array.pop(bullFVGBoxes)), label.delete(array.pop(bullFVGLbls))
+        array.pop(bullFVGTops), array.pop(bullFVGBots)
+        array.pop(bullFVGInZone), array.pop(bullFVGFired)
+        array.pop(bullFVGCreatedBar)   // [FIX #3]
+
+if bearFVG
+    fTop = low[2], fBot = high
+    array.unshift(bearFVGBoxes, box.new(bar_index-2, fTop, bar_index+zoneExtend, fBot, bgcolor=eBearFVG, border_color=color.new(bearFVGColor,55), border_width=1))
+    array.unshift(bearFVGTops, fTop), array.unshift(bearFVGBots, fBot)
+    array.unshift(bearFVGLbls, label.new(bar_index+15, (fTop+fBot)/2, "G Setup Sell", style=label.style_none, color=color.new(bearFVGColor,100), textcolor=color.white, size=size.tiny))
+    array.unshift(bearFVGInZone, false), array.unshift(bearFVGFired, false)
+    array.unshift(bearFVGCreatedBar, bar_index)   // [FIX #3]
+    if array.size(bearFVGBoxes) > 5
+        box.delete(array.pop(bearFVGBoxes)), label.delete(array.pop(bearFVGLbls))
+        array.pop(bearFVGTops), array.pop(bearFVGBots)
+        array.pop(bearFVGInZone), array.pop(bearFVGFired)
+        array.pop(bearFVGCreatedBar)   // [FIX #3]
+
+// [FIX #3] Bull FVG update loop: skip InZone/fire logic on the zone's own
+// creation bar. Without this, fTop == low of the creation candle, which
+// makes priceInGap trivially true on that same bar (the candle is "inside"
+// a zone defined by itself). That set InZone=true as an artifact, and the
+// very next bar could then fire immediately -- long before price ever
+// actually retested the gap. Gating on bar_index > createdBar forces a
+// genuine subsequent touch before wasIn can become true.
+if array.size(bullFVGBoxes) > 0 and (barstate.isconfirmed or barstate.islast)
+    ii = 0
+    while ii < array.size(bullFVGBoxes)
+        fTop   = array.get(bullFVGTops,   ii)
+        fBot   = array.get(bullFVGBots,   ii)
+        wasIn  = array.get(bullFVGInZone, ii)
+        fired  = array.get(bullFVGFired,  ii)
+        createdBar = array.get(bullFVGCreatedBar, ii)   // [FIX #3]
+        priceInGap = low <= fTop and high >= fBot
+        mitigated  = obMitigation == "Wick" ? low <= fBot : close <= fBot
+        if mitigated
+            box.delete(array.get(bullFVGBoxes,ii)), label.delete(array.get(bullFVGLbls,ii))
+            array.remove(bullFVGBoxes,ii), array.remove(bullFVGLbls,ii)
+            array.remove(bullFVGTops,ii),  array.remove(bullFVGBots,ii)
+            array.remove(bullFVGInZone,ii), array.remove(bullFVGFired,ii)
+            array.remove(bullFVGCreatedBar,ii)   // [FIX #3]
+        else
+            if bar_index > createdBar   // [FIX #3] skip creation bar
+                array.set(bullFVGInZone, ii, priceInGap)
+                if pcAlertFVG and trendBuyOK and wasIn and not priceInGap and barstate.isconfirmed
+                    if close > fTop and not fired
+                        sig_fvg_buy := true
+                        array.set(bullFVGFired, ii, true)
+                if priceInGap and fired
+                    array.set(bullFVGFired, ii, false)
+            if barstate.isconfirmed or barstate.islast
+                box.set_right(array.get(bullFVGBoxes,ii), bar_index+zoneExtend)
+            ii += 1
+
+// [FIX #3] Bear FVG update loop: same creation-bar gate as bull, mirrored.
+if array.size(bearFVGBoxes) > 0 and (barstate.isconfirmed or barstate.islast)
+    ii = 0
+    while ii < array.size(bearFVGBoxes)
+        fTop   = array.get(bearFVGTops,   ii)
+        fBot   = array.get(bearFVGBots,   ii)
+        wasIn  = array.get(bearFVGInZone, ii)
+        fired  = array.get(bearFVGFired,  ii)
+        createdBar = array.get(bearFVGCreatedBar, ii)   // [FIX #3]
+        priceInGap = low <= fTop and high >= fBot
+        mitigated  = obMitigation == "Wick" ? high >= fTop : close >= fTop
+        if mitigated
+            box.delete(array.get(bearFVGBoxes,ii)), label.delete(array.get(bearFVGLbls,ii))
+            array.remove(bearFVGBoxes,ii), array.remove(bearFVGLbls,ii)
+            array.remove(bearFVGTops,ii),  array.remove(bearFVGBots,ii)
+            array.remove(bearFVGInZone,ii), array.remove(bearFVGFired,ii)
+            array.remove(bearFVGCreatedBar,ii)   // [FIX #3]
+        else
+            if bar_index > createdBar   // [FIX #3] skip creation bar
+                array.set(bearFVGInZone, ii, priceInGap)
+                if pcAlertFVG and trendSellOK and wasIn and not priceInGap and barstate.isconfirmed
+                    if close < fBot and not fired
+                        sig_fvg_sell := true
+                        array.set(bearFVGFired, ii, true)
+                if priceInGap and fired
+                    array.set(bearFVGFired, ii, false)
+            if barstate.isconfirmed or barstate.islast
+                box.set_right(array.get(bearFVGBoxes,ii), bar_index+zoneExtend)
+            ii += 1
+
+// ═══════════════════════════════════════════════════════════════
+// S/R HELPER
+// ═══════════════════════════════════════════════════════════════
+isNearSR(lvl) =>
+    prox = isGoldPreset ? srProximityTicks : srProximityTicks * ptScale
+    szH = array.size(srHighs)
+    swingCnt = 0
+    if szH > 0
+        for k = 0 to szH-1
+            if math.abs(array.get(srHighs,k)-lvl) <= prox
+                swingCnt += 1
+                if swingCnt >= 2
+                    break
+    if swingCnt < 2
+        szL = array.size(srLows)
+        if szL > 0
+            for k = 0 to szL-1
+                if math.abs(array.get(srLows,k)-lvl) <= prox
+                    swingCnt += 1
+                    if swingCnt >= 2
+                        break
+    swingCnt >= 2
+
+// ═══════════════════════════════════════════════════════════════
+// QZONE SCORE + OPACITY
+// ═══════════════════════════════════════════════════════════════
+f_qzScore(hasQSwing, hasMZ, hasHist) =>
+    sc  = 0
+    sc += hasQSwing ? 1 : 0
+    sc += hasMZ     ? 1 : 0
+    sc += hasHist   ? 1 : 0
+    sc
+
+f_qzOpacityBull(sc) => bullZoneOpacity
+f_qzOpacityBear(sc) => bearZoneOpacity
+
+// ═══════════════════════════════════════════════════════════════
+// QZONE ARRAYS
+// ═══════════════════════════════════════════════════════════════
+var box[]    qzBullBoxes      = array.new<box>()
+var float[]  qzBullHighs      = array.new<float>()
+var float[]  qzBullLows       = array.new<float>()
+var int[]    qzBullBars       = array.new<int>()
+var int[]    qzBullScore      = array.new<int>()
+var int[]    qzBullTouch      = array.new<int>()
+var int[]    qzBullLastTouch  = array.new<int>()
+var bool[]   qzBullInZone     = array.new<bool>()
+var bool[]   qzBullApproachOK = array.new<bool>()
+var bool[]   qzBullConfirmed  = array.new<bool>()
+var bool[]   qzBullQShown     = array.new<bool>()
+var bool[]   qzBullFaded      = array.new<bool>()
+var bool[]   qzBullConf       = array.new<bool>()
+var label[]  qzBullLbls       = array.new<label>()
+var label[]  qzBullQLbls      = array.new<label>()
+var label[]  qzBullCrtLbls    = array.new<label>()
+var string[] qzBullSrc        = array.new<string>()
+var string[] qzBullVolTxt     = array.new<string>()
+var box[]    qzBullVolBoxB    = array.new<box>()
+var box[]    qzBullVolBoxS    = array.new<box>()
+var float[]  qzBullVolPct     = array.new<float>()
+var box[]    qzBearBoxes      = array.new<box>()
+var float[]  qzBearHighs      = array.new<float>()
+var float[]  qzBearLows       = array.new<float>()
+var int[]    qzBearBars       = array.new<int>()
+var int[]    qzBearScore      = array.new<int>()
+var int[]    qzBearTouch      = array.new<int>()
+var int[]    qzBearLastTouch  = array.new<int>()
+var bool[]   qzBearInZone     = array.new<bool>()
+var bool[]   qzBearApproachOK = array.new<bool>()
+var bool[]   qzBearConfirmed  = array.new<bool>()
+var bool[]   qzBearQShown     = array.new<bool>()
+var bool[]   qzBearFaded      = array.new<bool>()
+var bool[]   qzBearConf       = array.new<bool>()
+var label[]  qzBearLbls       = array.new<label>()
+var label[]  qzBearQLbls      = array.new<label>()
+var label[]  qzBearCrtLbls    = array.new<label>()
+var string[] qzBearSrc        = array.new<string>()
+var string[] qzBearVolTxt     = array.new<string>()
+var box[]    qzBearVolBoxB    = array.new<box>()
+var box[]    qzBearVolBoxS    = array.new<box>()
+var float[]  qzBearVolPct     = array.new<float>()
+
+var int qLastBullBar = 0
+var int qLastBearBar = 0
+
+f_qzMergeBull(newH, newL, newBar) =>
+    merged = false
+    sz = array.size(qzBullBoxes)
+    if sz > 0
+        for k = 0 to sz-1
+            exH = array.get(qzBullHighs,k), exL = array.get(qzBullLows,k)
+            midNew = (newH+newL)/2, midExst = (exH+exL)/2
+            overlaps = newH >= exL and newL <= exH
+            nearMid  = math.abs(midNew-midExst) <= effMergRadM1
+            if (overlaps or nearMid) and (newBar - array.get(qzBullBars,k)) <= qMergeWindow
+                mergedH = math.max(exH,newH), mergedL = math.min(exL,newL)
+                box.set_top(array.get(qzBullBoxes,k),mergedH), box.set_bottom(array.get(qzBullBoxes,k),mergedL)
+                array.set(qzBullHighs,k,mergedH), array.set(qzBullLows,k,mergedL)
+                merged := true
+                break
+    merged
+
+f_qzMergeBear(newH, newL, newBar) =>
+    merged = false
+    sz = array.size(qzBearBoxes)
+    if sz > 0
+        for k = 0 to sz-1
+            exH = array.get(qzBearHighs,k), exL = array.get(qzBearLows,k)
+            midNew = (newH+newL)/2, midExst = (exH+exL)/2
+            overlaps = newH >= exL and newL <= exH
+            nearMid  = math.abs(midNew-midExst) <= effMergRadM1
+            if (overlaps or nearMid) and (newBar - array.get(qzBearBars,k)) <= qMergeWindow
+                mergedH = math.max(exH,newH), mergedL = math.min(exL,newL)
+                box.set_top(array.get(qzBearBoxes,k),mergedH), box.set_bottom(array.get(qzBearBoxes,k),mergedL)
+                array.set(qzBearHighs,k,mergedH), array.set(qzBearLows,k,mergedL)
+                merged := true
+                break
+    merged
+
+f_checkBullConf(zH, zL) =>
+    hasConf = false
+    if showConfluence
+        szF = array.size(bullFVGBoxes)
+        if szF > 0
+            for fi = 0 to szF-1
+                if math.min(zH,array.get(bullFVGTops,fi)) > math.max(zL,array.get(bullFVGBots,fi))
+                    hasConf := true
+                    break
+    hasConf
+
+f_checkBearConf(zH, zL) =>
+    hasConf = false
+    if showConfluence
+        szF = array.size(bearFVGBoxes)
+        if szF > 0
+            for fi = 0 to szF-1
+                if math.min(zH,array.get(bearFVGTops,fi)) > math.max(zL,array.get(bearFVGBots,fi))
+                    hasConf := true
+                    break
+    hasConf
+
+f_applyBullConf(idx, hasConf) =>
+    if hasConf
+        box.set_border_color(array.get(qzBullBoxes,idx), confBorderColor)
+        box.set_border_width(array.get(qzBullBoxes,idx), 3)
+    else
+        box.set_border_color(array.get(qzBullBoxes,idx), #1B5E20)
+        box.set_border_width(array.get(qzBullBoxes,idx), 2)
+
+f_applyBearConf(idx, hasConf) =>
+    if hasConf
+        box.set_border_color(array.get(qzBearBoxes,idx), confBorderColor)
+        box.set_border_width(array.get(qzBearBoxes,idx), 3)
+    else
+        box.set_border_color(array.get(qzBearBoxes,idx), #7f0000)
+        box.set_border_width(array.get(qzBearBoxes,idx), 2)
+
+f_addQZBull(zH, zL, zBar, sc, srcStr, zWickLow, prevBodyL = 0.0) =>
+    _zSz = zH - zL
+    _szOK = atrOnlyMode ? (_zSz >= _atrMinOB and _zSz <= _atrMaxOB) : (_zSz >= effMinOBPts and _zSz <= effMaxOBPts and _zSz >= _atrMinOB and _zSz <= _atrMaxOB)
+    if sc >= effMinScore and _zSz >= effMinZoneHtM1 and _szOK
+        _newMidB = (zH+zL)/2
+        isDupB = false
+        _dBSz = array.size(qzBullBoxes)
+        if _dBSz > 0
+            for _dk = 0 to _dBSz-1
+                if _newMidB >= array.get(qzBullLows,_dk) and _newMidB <= array.get(qzBullHighs,_dk)
+                    isDupB := true
+                    break
+        blocked = isDupB
+        if qOppositeBlock > 0 and not blocked
+            szBr = array.size(qzBearBoxes)
+            if szBr > 0
+                for k = 0 to szBr-1
+                    if math.abs(_newMidB-(array.get(qzBearHighs,k)+array.get(qzBearLows,k))/2) <= _atrOppBlk
+                        blocked := true
+        if not blocked
+            op  = f_qzOpacityBull(sc)
+            mid = (zH+zL)/2
+            [_bv, _sv, _bcnt] = f_zoneVol(zH, zL)
+            _total    = _bv + _sv
+            _buyPct   = _total > 0 ? _bv / _total : 0.5
+            _sellPct  = 1.0 - _buyPct
+            _rsk      = showVolInfo and _bcnt > 0 ? f_volRisk(_bv, _sv, _bcnt) : ""
+            _strength = _rsk == "LOW RISK" ? "MTL STRONG SUPPORT" : _rsk == "MED RISK" ? "MTL MODERATE SUPPORT" : _rsk == "HIGH RISK" ? "MTL WEAK SUPPORT" : "MTL SUPPORT"
+            _zoneHt   = zH - zL
+            _bgB = showVolInfo ? color.new(#00C853, 40) : color.new(color.white, 100)
+            _bgS = showVolInfo ? color.new(#FF1744, 40) : color.new(color.white, 100)
+            _bPctTxt    = showVolInfo ? str.tostring(math.round(_buyPct  * 100)) + "%" : ""
+            _sPctTxt    = showVolInfo ? str.tostring(math.round(_sellPct * 100)) + "%" : ""
+            _bBoxTop = zL + _zoneHt * _buyPct
+            _sBoxBot = _bBoxTop
+            _bRight  = zBar + math.round((bar_index + zoneExtend - zBar) * _buyPct)
+            _sRight  = zBar + math.round((bar_index + zoneExtend - zBar) * _sellPct)
+            _combVolTxt = showVolInfo ? _bPctTxt + " B | " + _sPctTxt + " S\n" + _strength : ""
+            _stars = sc >= 3 ? " ●●●" : sc >= 2 ? " ●●" : " ●"
+            _tip   = "Source: " + srcStr + "  Score: " + str.tostring(sc) + "/3\nH: " + str.tostring(zH, format.mintick) + "  L: " + str.tostring(zL, format.mintick) + (showVolInfo ? "\n" + _combVolTxt : "")
+            b       = box.new(zBar, zH, bar_index+zoneExtend, zL, bgcolor=color.new(#00C853,93), border_color=#1B5E20, border_width=2)
+            lbl  = showVolInfo ? label.new(bar_index, mid, _combVolTxt, style=label.style_none, color=color.new(color.black,100), textcolor=color.white, size=size.normal, textalign=text.align_right) : na
+            ql   = label.new(zBar,zL,"", style=label.style_none, color=color.new(C_BULL,100), textcolor=C_WHITE, size=size.small)
+            crtl = label.new(zBar,zL, showQLabels and not cleanMode ? "✦ MTL Buy" + _stars : "", style=showQLabels and not cleanMode ? label.style_label_up : label.style_none, color=bullZoneColor, textcolor=C_WHITE, size=size.normal, tooltip=_tip)
+            if showVolInfo
+                volBoxB = box.new(zBar, _bBoxTop, _bRight, zL,   bgcolor=_bgB, border_color=color.new(color.white,100))
+                volBoxS = box.new(zBar, zH,       _sRight, _sBoxBot, bgcolor=_bgS, border_color=color.new(color.white,100))
+                array.unshift(qzBullVolBoxB,volBoxB), array.unshift(qzBullVolBoxS,volBoxS)
+                array.unshift(qzBullVolPct, _buyPct)
+            array.unshift(qzBullBoxes,b),         array.unshift(qzBullHighs,zH),       array.unshift(qzBullLows,zL)
+            array.unshift(qzBullBars,zBar),       array.unshift(qzBullScore,sc),       array.unshift(qzBullTouch,0)
+            array.unshift(qzBullLastTouch,-999),  array.unshift(qzBullInZone,false)
+            array.unshift(qzBullApproachOK,false),array.unshift(qzBullConfirmed,false)
+            array.unshift(qzBullQShown,false),    array.unshift(qzBullFaded,false)
+            array.unshift(qzBullLbls,lbl),        array.unshift(qzBullQLbls,ql),       array.unshift(qzBullCrtLbls,crtl)
+            array.unshift(qzBullSrc,srcStr),      array.unshift(qzBullVolTxt,_combVolTxt)
+            initConf = f_checkBullConf(zH,zL)
+            array.unshift(qzBullConf,initConf)
+            f_applyBullConf(0,initConf)
+            if array.size(qzBullBoxes) > effMaxZonesM1
+                box.delete(array.pop(qzBullBoxes)), label.delete(array.pop(qzBullLbls))
+                label.delete(array.pop(qzBullQLbls)), label.delete(array.pop(qzBullCrtLbls))
+                array.pop(qzBullHighs),  array.pop(qzBullLows),    array.pop(qzBullBars)
+                array.pop(qzBullScore),  array.pop(qzBullTouch),   array.pop(qzBullLastTouch)
+                array.pop(qzBullApproachOK), array.pop(qzBullConfirmed), array.pop(qzBullInZone)
+                array.pop(qzBullQShown), array.pop(qzBullFaded),   array.pop(qzBullSrc)
+                array.pop(qzBullConf),   array.pop(qzBullVolTxt)
+                if showVolInfo
+                    box.delete(array.pop(qzBullVolBoxB)), box.delete(array.pop(qzBullVolBoxS))
+                    array.pop(qzBullVolPct)
+
+f_addQZBear(zH, zL, zBar, sc, srcStr, zWickHigh, prevBodyH = 0.0) =>
+    _zSz = zH - zL
+    _szOK = atrOnlyMode ? (_zSz >= _atrMinOB and _zSz <= _atrMaxOB) : (_zSz >= effMinOBPts and _zSz <= effMaxOBPts and _zSz >= _atrMinOB and _zSz <= _atrMaxOB)
+    if sc >= effMinScore and _zSz >= effMinZoneHtM1 and _szOK
+        _newMidR = (zH+zL)/2
+        isDupR = false
+        _dRSz = array.size(qzBearBoxes)
+        if _dRSz > 0
+            for _dk = 0 to _dRSz-1
+                if _newMidR >= array.get(qzBearLows,_dk) and _newMidR <= array.get(qzBearHighs,_dk)
+                    isDupR := true
+                    break
+        blocked = isDupR
+        if qOppositeBlock > 0 and not blocked
+            szBl = array.size(qzBullBoxes)
+            if szBl > 0
+                for k = 0 to szBl-1
+                    if math.abs(_newMidR-(array.get(qzBullHighs,k)+array.get(qzBullLows,k))/2) <= _atrOppBlk
+                        blocked := true
+        if not blocked
+            op  = f_qzOpacityBear(sc)
+            mid = (zH+zL)/2
+            [_rv, _sv2, _rcnt] = f_zoneVol(zH, zL)
+            _rtotal    = _rv + _sv2
+            _rbuyPct   = _rtotal > 0 ? _rv / _rtotal : 0.5
+            _rsellPct  = 1.0 - _rbuyPct
+            _rrsk      = showVolInfo and _rcnt > 0 ? f_volRisk(_rv, _sv2, _rcnt) : ""
+            _rstrength = _rrsk == "LOW RISK" ? "MTL STRONG RESISTANCE" : _rrsk == "MED RISK" ? "MTL MODERATE RESISTANCE" : _rrsk == "HIGH RISK" ? "MTL WEAK RESISTANCE" : "MTL RESISTANCE"
+            _rzoneHt   = zH - zL
+            _rbgB = showVolInfo ? color.new(#00C853, 40) : color.new(color.white, 100)
+            _rbgS = showVolInfo ? color.new(#FF1744, 40) : color.new(color.white, 100)
+            _rbPctTxt    = showVolInfo ? str.tostring(math.round(_rbuyPct  * 100)) + "%" : ""
+            _rsPctTxt    = showVolInfo ? str.tostring(math.round(_rsellPct * 100)) + "%" : ""
+            _rZoneHt  = zH - zL
+            _rbBoxTop = zL + _rZoneHt * _rbuyPct
+            _rsBoxBot = _rbBoxTop
+            _rbRight  = zBar + math.round((bar_index + zoneExtend - zBar) * _rbuyPct)
+            _rsRight  = zBar + math.round((bar_index + zoneExtend - zBar) * _rsellPct)
+            _rcombVolTxt = showVolInfo ? _rbPctTxt + " B | " + _rsPctTxt + " S\n" + _rstrength : ""
+            _rstars = sc >= 3 ? " ●●●" : sc >= 2 ? " ●●" : " ●"
+            _rtip   = "Source: " + srcStr + "  Score: " + str.tostring(sc) + "/3\nH: " + str.tostring(zH, format.mintick) + "  L: " + str.tostring(zL, format.mintick) + (showVolInfo ? "\n" + _rcombVolTxt : "")
+            b        = box.new(zBar, zH, bar_index+zoneExtend, zL, bgcolor=color.new(#c62828,93), border_color=#7f0000, border_width=2)
+            lbl  = showVolInfo ? label.new(bar_index, mid, _rcombVolTxt, style=label.style_none, color=color.new(color.black,100), textcolor=color.white, size=size.normal, textalign=text.align_right) : na
+            ql   = label.new(zBar,zH,"", style=label.style_none, color=color.new(C_BEAR,100), textcolor=C_WHITE, size=size.small)
+            crtl = label.new(zBar,zH, showQLabels and not cleanMode ? "✦ MTL Sell" + _rstars : "", style=showQLabels and not cleanMode ? label.style_label_down : label.style_none, color=bearZoneColor, textcolor=C_WHITE, size=size.normal, tooltip=_rtip)
+            if showVolInfo
+                rvolBoxB = box.new(zBar, _rbBoxTop, _rbRight, zL,       bgcolor=_rbgB, border_color=color.new(color.white,100))
+                rvolBoxS = box.new(zBar, zH,        _rsRight, _rsBoxBot, bgcolor=_rbgS, border_color=color.new(color.white,100))
+                array.unshift(qzBearVolBoxB,rvolBoxB),array.unshift(qzBearVolBoxS,rvolBoxS)
+                array.unshift(qzBearVolPct, _rbuyPct)
+            array.unshift(qzBearBoxes,b),         array.unshift(qzBearHighs,zH),       array.unshift(qzBearLows,zL)
+            array.unshift(qzBearBars,zBar),       array.unshift(qzBearScore,sc),       array.unshift(qzBearTouch,0)
+            array.unshift(qzBearLastTouch,-999),  array.unshift(qzBearInZone,false)
+            array.unshift(qzBearApproachOK,false),array.unshift(qzBearConfirmed,false)
+            array.unshift(qzBearQShown,false),    array.unshift(qzBearFaded,false)
+            array.unshift(qzBearLbls,lbl),        array.unshift(qzBearQLbls,ql),       array.unshift(qzBearCrtLbls,crtl)
+            array.unshift(qzBearSrc,srcStr),      array.unshift(qzBearVolTxt,_rcombVolTxt)
+            initConf = f_checkBearConf(zH,zL)
+            array.unshift(qzBearConf,initConf)
+            f_applyBearConf(0,initConf)
+            if array.size(qzBearBoxes) > effMaxZonesM1
+                box.delete(array.pop(qzBearBoxes)), label.delete(array.pop(qzBearLbls))
+                label.delete(array.pop(qzBearQLbls)), label.delete(array.pop(qzBearCrtLbls))
+                array.pop(qzBearHighs),  array.pop(qzBearLows),    array.pop(qzBearBars)
+                array.pop(qzBearScore),  array.pop(qzBearTouch),   array.pop(qzBearLastTouch)
+                array.pop(qzBearApproachOK), array.pop(qzBearConfirmed), array.pop(qzBearInZone)
+                array.pop(qzBearQShown), array.pop(qzBearFaded),   array.pop(qzBearSrc)
+                array.pop(qzBearConf),   array.pop(qzBearVolTxt)
+                if showVolInfo
+                    box.delete(array.pop(qzBearVolBoxB)), box.delete(array.pop(qzBearVolBoxS))
+                    array.pop(qzBearVolPct)
+
+// ═══════════════════════════════════════════════════════════════
+// SOURCE 1 — Q SWING
+// ═══════════════════════════════════════════════════════════════
+qPH = ta.pivothigh(high, effQSwingLen, effQSwingLen)
+qPL = ta.pivotlow (low,  effQSwingLen, effQSwingLen)
+qPHBar = bar_index - effQSwingLen
+qPLBar = bar_index - effQSwingLen
+
+if qTFActive
+    if not na(qPL) and (not isM1TF or (bar_index - qPLBar) >= 0)
+        qBarGap = qLastBullBar == 0 or (qPLBar - qLastBullBar) >= effMinBarsM1
+        qLegOK  = true
+        if qMinSwingAtr > 0 or isLowTF
+            qLeg = 0.0
+            for k = 1 to effQSwingLen
+                qLeg := math.max(qLeg, high[effQSwingLen+k] - qPL)
+            qLegOK := qLeg >= effMinSwingLeg
+        if qLegOK and qBarGap
+            qObIdx = effQSwingLen
+            qZH = qUseBodyOnly ? math.max(open[qObIdx],close[qObIdx]) : high[qObIdx]
+            qZL = qUseBodyOnly ? math.min(open[qObIdx],close[qObIdx]) : low[qObIdx]
+            if qZH - qZL < _atrQZMin
+                qZH := high[qObIdx], qZL := low[qObIdx]
+            if not f_qzMergeBull(qZH,qZL,qPLBar)
+                hasHist = not isM1TF and (isNearSR((qZH+qZL)/2) or isNearSR(qZH) or isNearSR(qZL))
+                sc = f_qzScore(true,false,hasHist)
+                f_addQZBull(qZH,qZL,qPLBar,sc,"QS",low[qObIdx])
+            qLastBullBar := qPLBar
+    if not na(qPH)
+        qBarGap = qLastBearBar == 0 or (qPHBar - qLastBearBar) >= effMinBarsM1
+        qLegOK  = true
+        if qMinSwingAtr > 0 or isLowTF
+            qLeg = 0.0
+            for k = 1 to effQSwingLen
+                qLeg := math.max(qLeg, qPH - low[effQSwingLen+k])
+            qLegOK := qLeg >= effMinSwingLeg
+        if qLegOK and qBarGap
+            qObIdx = effQSwingLen
+            qZH = qUseBodyOnly ? math.max(open[qObIdx],close[qObIdx]) : high[qObIdx]
+            qZL = qUseBodyOnly ? math.min(open[qObIdx],close[qObIdx]) : low[qObIdx]
+            if qZH - qZL < _atrQZMin
+                qZH := high[qObIdx], qZL := low[qObIdx]
+            if not f_qzMergeBear(qZH,qZL,qPHBar)
+                hasHist = not isM1TF and (isNearSR((qZH+qZL)/2) or isNearSR(qZH) or isNearSR(qZL))
+                sc = f_qzScore(true,false,hasHist)
+                f_addQZBear(qZH,qZL,qPHBar,sc,"QS",high[qObIdx])
+            qLastBearBar := qPHBar
+
+// ═══════════════════════════════════════════════════════════════
+// SOURCE 2 — MZ
+// ═══════════════════════════════════════════════════════════════
+mzCurrBodyH = math.max(open[1],close[1]), mzCurrBodyL = math.min(open[1],close[1])
+mzCurrBody  = mzCurrBodyH - mzCurrBodyL,  mzCurrRange = high[1] - low[1]
+mzPrevBodyH = math.max(open[2],close[2]), mzPrevBodyL = math.min(open[2],close[2])
+mzPrevBody  = mzPrevBodyH - mzPrevBodyL,  mzPrevRange = high[2] - low[2]
+
+mzFullEngulf    = mzCurrBodyH > mzPrevBodyH and mzCurrBodyL < mzPrevBodyL
+mzPrevBodyOK    = mzPrevRange > 0 and (mzPrevBody/mzPrevRange) >= mzMinPrevBody
+mzCurrBodyQOK   = mzCurrRange > 0 and (mzCurrBody/mzCurrRange) >= mzMinCurrBody
+mzEngulfRatioOK = mzPrevBody > 0 and (mzCurrBody/mzPrevBody) >= mzMinEngulfPct
+mzBodyAtrOK     = mzCurrBody >= _atrMZMin and mzCurrBody <= _atrMZMax
+mzBullCloseOK   = mzCurrRange > 0 and (close[1]-low[1]) /mzCurrRange >= mzCloseExtreme
+mzBearCloseOK   = mzCurrRange > 0 and (high[1]-close[1])/mzCurrRange >= mzCloseExtreme
+mzDropInto      = math.max(high[2],high[3]) - low[1]
+mzRallyInto     = high[1] - math.min(low[2],low[3])
+mzLegBullOK     = mzMinLeg <= 0 or mzDropInto  >= _atrMZLeg
+mzLegBearOK     = mzMinLeg <= 0 or mzRallyInto >= _atrMZLeg
+mzAtPriorHigh   = mzSwingProx <= 0 or (not na(lastSH) and math.abs(high[1]-lastSH) <= _atrMZProx)
+mzAtPriorLow    = mzSwingProx <= 0 or (not na(lastSL) and math.abs(low[1] -lastSL) <= _atrMZProx)
+mzPrevBullWick  = math.min(open[2],close[2]) - low[2]
+mzPrevBearWick  = high[2] - math.max(open[2],close[2])
+mzBullWickOK    = mzMinWick <= 0 or (mzPrevBody > 0 and (mzPrevBullWick/mzPrevBody) >= mzMinWick)
+mzBearWickOK    = mzMinWick <= 0 or (mzPrevBody > 0 and (mzPrevBearWick/mzPrevBody) >= mzMinWick)
+
+mzCurrIsBull = close[1] > open[1], mzCurrIsBear = close[1] < open[1]
+mzPrevIsBear = close[2] < open[2], mzPrevIsBull = close[2] > open[2]
+
+mzBullDetect = qTFActive and not isM1TF and
+     mzCurrIsBull and mzPrevIsBear and mzFullEngulf and mzPrevBodyOK and
+     mzCurrBodyQOK and mzEngulfRatioOK and mzBodyAtrOK and mzBullCloseOK and
+     mzLegBullOK and mzAtPriorLow and mzBullWickOK
+
+mzBearDetect = qTFActive and not isM1TF and
+     mzCurrIsBear and mzPrevIsBull and mzFullEngulf and mzPrevBodyOK and
+     mzCurrBodyQOK and mzEngulfRatioOK and mzBodyAtrOK and mzBearCloseOK and
+     mzLegBearOK and mzAtPriorHigh and mzBearWickOK
+
+if mzBullDetect
+    zH = mzCurrBodyH, zL = mzCurrBodyL
+    nearSR  = not isM1TF and (isNearSR((zH+zL)/2) or isNearSR(zH) or isNearSR(zL))
+    _mzSzOK = atrOnlyMode or (zH-zL >= effMinOBPts and zH-zL <= effMaxOBPts)
+    if _mzSzOK and (not mzRequireSR or nearSR)
+        if not f_qzMergeBull(zH,zL,bar_index-1)
+            sc = f_qzScore(false,true,nearSR)
+            f_addQZBull(zH,zL,bar_index-1,sc,"MZ",low[1],mzPrevBodyL)
+
+if mzBearDetect
+    zH = mzCurrBodyH, zL = mzCurrBodyL
+    nearSR  = not isM1TF and (isNearSR((zH+zL)/2) or isNearSR(zH) or isNearSR(zL))
+    _mzSzOK = atrOnlyMode or (zH-zL >= effMinOBPts and zH-zL <= effMaxOBPts)
+    if _mzSzOK and (not mzRequireSR or nearSR)
+        if not f_qzMergeBear(zH,zL,bar_index-1)
+            sc = f_qzScore(false,true,nearSR)
+            f_addQZBear(zH,zL,bar_index-1,sc,"MZ",high[1],mzPrevBodyH)
+
+// ═══════════════════════════════════════════════════════════════
+// SOURCE 3 — BASE ZONE
+// ═══════════════════════════════════════════════════════════════
+_bzMaxRange = atrValue * bzMaxRangeAtr
+_bzMinRange = atrValue * bzMinRangeAtr
+_bzBreakout = atrValue * bzBreakoutAtr
+_bzLookback = math.min(bzLookback, bar_index - 1)
+
+bzBullBreak = false, bzBearBreak = false
+bzH = 0.0, bzL = 0.0, bzStartBar = 0
+
+if showBaseZones and qTFActive and not isM1TF and barstate.isconfirmed and bzRunThisBar and _bzLookback >= bzMinBars
+    _found = false, _winH = high[1], _winL = low[1], _winStart = 1
+    for _j = 1 to _bzLookback
+        _barH = high[_j], _barL = low[_j]
+        _newH = math.max(_winH,_barH), _newL = math.min(_winL,_barL)
+        _rng  = _newH - _newL
+        if _rng > _bzMaxRange
+            _winLen = _j - _winStart
+            if not _found and _winLen >= bzMinBars
+                _wRng = _winH - _winL
+                if _wRng >= _bzMinRange and _wRng <= _bzMaxRange
+                    if close > _winH + _bzBreakout
+                        bzBullBreak := true, bzH := _winH, bzL := _winL, bzStartBar := bar_index-_j+1, _found := true
+                    else if close < _winL - _bzBreakout
+                        bzBearBreak := true, bzH := _winH, bzL := _winL, bzStartBar := bar_index-_j+1, _found := true
+            _winH := _barH, _winL := _barL, _winStart := _j
+        else
+            _winH := _newH, _winL := _newL
+    if not _found
+        _winLen = _bzLookback - _winStart + 1
+        if _winLen >= bzMinBars
+            _wRng = _winH - _winL
+            if _wRng >= _bzMinRange and _wRng <= _bzMaxRange
+                if close > _winH + _bzBreakout
+                    bzBullBreak := true, bzH := _winH, bzL := _winL, bzStartBar := bar_index - _bzLookback
+                else if close < _winL - _bzBreakout
+                    bzBearBreak := true, bzH := _winH, bzL := _winL, bzStartBar := bar_index - _bzLookback
+
+if bzBullBreak
+    nearSR = not isM1TF and (isNearSR((bzH+bzL)/2) or isNearSR(bzH) or isNearSR(bzL))
+    if not f_qzMergeBull(bzH,bzL,bzStartBar)
+        sc = f_qzScore(false,false,nearSR)
+        f_addQZBull(bzH,bzL,bzStartBar,sc,"BZ",bzL)
+
+if bzBearBreak
+    nearSR = not isM1TF and (isNearSR((bzH+bzL)/2) or isNearSR(bzH) or isNearSR(bzL))
+    if not f_qzMergeBear(bzH,bzL,bzStartBar)
+        sc = f_qzScore(false,false,nearSR)
+        f_addQZBear(bzH,bzL,bzStartBar,sc,"BZ",bzH)
+
+// ═══════════════════════════════════════════════════════════════
+// SOURCE 4 — ORDER BLOCK
+// ═══════════════════════════════════════════════════════════════
+var float obLastSwingHigh = na, var float obLastSwingLow  = na
+var int   obLastSwingHighBar = na, var int obLastSwingLowBar  = na
+var float obPrevSwingHigh = na, var float obPrevSwingLow  = na
+var int   obLastBullEvent = 0,  var int   obLastBearEvent = 0
+
+obPH = ta.pivothigh(high,obSwingLen,obSwingLen)
+obPL = ta.pivotlow (low, obSwingLen,obSwingLen)
+obPHBar = bar_index - obSwingLen
+obPLBar = bar_index - obSwingLen
+
+if not na(obPH)
+    legDown = 0.0
+    for k = 1 to obSwingLen
+        legDown := math.max(legDown, obPH - low[obSwingLen+k])
+    if legDown >= _atrOBMinLeg
+        obPrevSwingHigh := obLastSwingHigh, obLastSwingHigh := obPH, obLastSwingHighBar := obPHBar
+
+if not na(obPL)
+    legUp = 0.0
+    for k = 1 to obSwingLen
+        legUp := math.max(legUp, high[obSwingLen+k] - obPL)
+    if legUp >= _atrOBMinLeg
+        obPrevSwingLow := obLastSwingLow, obLastSwingLow := obPL, obLastSwingLowBar := obPLBar
+
+obCurrRange   = high - low
+obCurrBody    = math.abs(close - open)
+obCurrIsBull  = close > open, obCurrIsBear = close < open
+obBodyOK      = obCurrBody >= _atrOBBodyDisp
+obBullCloseOK = obCurrRange > 0 and (close-low) /obCurrRange >= obCloseExtreme
+obBearCloseOK = obCurrRange > 0 and (high-close)/obCurrRange >= obCloseExtreme
+obDispBull    = obCurrIsBull and obBodyOK and obBullCloseOK
+obDispBear    = obCurrIsBear and obBodyOK and obBearCloseOK
+
+obBullBreakLevel = not na(obLastSwingHigh) ? obLastSwingHigh + _atrOBBreak : na
+obBearBreakLevel = not na(obLastSwingLow)  ? obLastSwingLow  - _atrOBBreak : na
+
+obBullStructBreak = not na(obBullBreakLevel) and barstate.isconfirmed and
+     (obConfirmClose ? close > obBullBreakLevel : high > obBullBreakLevel) and
+     (not obRequireDisp or obDispBull) and (bar_index - obLastBullEvent) >= obMinBarsBetween
+
+obBearStructBreak = not na(obBearBreakLevel) and barstate.isconfirmed and
+     (obConfirmClose ? close < obBearBreakLevel : low < obBearBreakLevel) and
+     (not obRequireDisp or obDispBear) and (bar_index - obLastBearEvent) >= obMinBarsBetween
+
+var box[]    obBullBoxes  = array.new<box>(),   var float[] obBullHighs = array.new<float>()
+var float[]  obBullLows   = array.new<float>(), var int[]   obBullBars  = array.new<int>()
+var label[]  obBullLbls   = array.new<label>(), var bool[]  obBullMit   = array.new<bool>()
+var string[] obBullVolTxt = array.new<string>()
+var box[]    obBullVolBoxB = array.new<box>()
+var box[]    obBullVolBoxS = array.new<box>()
+var float[]  obBullVolPct  = array.new<float>()
+var label[]  obBullPctLblB = array.new<label>()
+var box[]    obBearBoxes  = array.new<box>(),   var float[] obBearHighs = array.new<float>()
+var float[]  obBearLows   = array.new<float>(), var int[]   obBearBars  = array.new<int>()
+var label[]  obBearLbls   = array.new<label>(), var bool[]  obBearMit   = array.new<bool>()
+var string[] obBearVolTxt = array.new<string>()
+var box[]    obBearVolBoxB = array.new<box>()
+var box[]    obBearVolBoxS = array.new<box>()
+var float[]  obBearVolPct  = array.new<float>()
+var label[]  obBearPctLblB = array.new<label>()
+
+f_obMergeBull(newH, newL, newBar) =>
+    merged = false
+    sz = array.size(obBullBoxes)
+    if sz > 0
+        for k = 0 to sz-1
+            exH = array.get(obBullHighs,k), exL = array.get(obBullLows,k)
+            midNew = (newH+newL)/2, midExst = (exH+exL)/2
+            overlaps = newH >= exL and newL <= exH
+            nearMid  = math.abs(midNew-midExst) <= _atrOBMrgRad
+            if (overlaps or nearMid) and (newBar - array.get(obBullBars,k)) <= obMergeWindow
+                mH = math.max(exH,newH), mL = math.min(exL,newL)
+                box.set_top(array.get(obBullBoxes,k),mH), box.set_bottom(array.get(obBullBoxes,k),mL)
+                array.set(obBullHighs,k,mH), array.set(obBullLows,k,mL)
+                merged := true
+                break
+    merged
+
+f_obMergeBear(newH, newL, newBar) =>
+    merged = false
+    sz = array.size(obBearBoxes)
+    if sz > 0
+        for k = 0 to sz-1
+            exH = array.get(obBearHighs,k), exL = array.get(obBearLows,k)
+            midNew = (newH+newL)/2, midExst = (exH+exL)/2
+            overlaps = newH >= exL and newL <= exH
+            nearMid  = math.abs(midNew-midExst) <= _atrOBMrgRad
+            if (overlaps or nearMid) and (newBar - array.get(obBearBars,k)) <= obMergeWindow
+                mH = math.max(exH,newH), mL = math.min(exL,newL)
+                box.set_top(array.get(obBearBoxes,k),mH), box.set_bottom(array.get(obBearBoxes,k),mL)
+                array.set(obBearHighs,k,mH), array.set(obBearLows,k,mL)
+                merged := true
+                break
+    merged
+
+// ─────────────────────────────────────────────────────────────
+// BLOCK A — BULL
+// ─────────────────────────────────────────────────────────────
+if showOBZones and obBullStructBreak and not na(obLastSwingLow) and not na(obLastSwingLowBar)
+    obIdx = bar_index - obLastSwingLowBar
+    if obIdx >= 0 and obIdx < 500
+        obZH = math.max(open[obIdx], close[obIdx])
+        obZL = math.min(open[obIdx], close[obIdx])
+        if obZH - obZL < _atrQZMin
+            obZH := high[obIdx]
+            obZL := low[obIdx]
+        _obSz = obZH - obZL
+        _obSizeOK = atrOnlyMode ?
+             (_obSz >= _atrMinOB and _obSz <= _atrMaxOB) :
+             (_obSz >= _atrMinOB and _obSz <= _atrMaxOB and _obSz >= effMinOBPts and _obSz <= effMaxOBPts)
+        if _obSizeOK and not f_obMergeBull(obZH, obZL, obLastSwingLowBar)
+            [_obBv, _obSv, _obCnt] = f_zoneVol(obZH, obZL)
+            _obTotal    = _obBv + _obSv
+            _obBuyPct   = _obTotal > 0 ? _obBv / _obTotal : 0.5
+            _obSellPct  = 1.0 - _obBuyPct
+            _obRsk      = showVolInfo and _obCnt > 0 ? f_volRisk(_obBv, _obSv, _obCnt) : ""
+            _obStrength = _obRsk == "LOW RISK" ? "MTL STRONG SUPPORT" : _obRsk == "MED RISK" ? "MTL MODERATE SUPPORT" : _obRsk == "HIGH RISK" ? "MTL WEAK SUPPORT" : "MTL SUPPORT"
+            _obZoneHt   = obZH - obZL
+            _obBgB = showVolInfo ? color.new(#00C853, 40) : color.new(color.white, 100)
+            _obBgS = showVolInfo ? color.new(#FF1744, 40) : color.new(color.white, 100)
+            _obBPctTxt = showVolInfo ? str.tostring(math.round(_obBuyPct  * 100)) + "%" : ""
+            _obSPctTxt = showVolInfo ? str.tostring(math.round(_obSellPct * 100)) + "%" : ""
+            _obBBoxTop = obZL + _obZoneHt * _obBuyPct
+            _obSBoxBot = _obBBoxTop
+            _obBRight  = obLastSwingLowBar + math.round((bar_index + zoneExtend - obLastSwingLowBar) * _obBuyPct)
+            _obSRight  = obLastSwingLowBar + math.round((bar_index + zoneExtend - obLastSwingLowBar) * _obSellPct)
+            _obMid        = (obZH + obZL) / 2
+            _obCombVolTxt = showVolInfo ? _obBPctTxt + " B | " + _obSPctTxt + " S\n" + _obStrength : ""
+            _obTip = "OB Bull\nH: " + str.tostring(obZH, format.mintick) + "  L: " + str.tostring(obZL, format.mintick) + (showVolInfo ? "\n" + _obCombVolTxt : "")
+            b = box.new(obLastSwingLowBar, obZH, bar_index+zoneExtend, obZL, bgcolor=color.new(#00C853,93), border_color=#1B5E20, border_width=2)
+            obPctLbl = showVolInfo ? label.new(bar_index, _obMid, _obCombVolTxt, style=label.style_none, color=color.new(color.black,100), textcolor=color.white, size=size.normal, textalign=text.align_right) : na
+            lbl = label.new(obLastSwingLowBar, obZL, showOBLabels and not cleanMode ? "✦ MTL Buy" : "", style=showOBLabels and not cleanMode ? label.style_label_up : label.style_none, color=obBullColor, textcolor=color.white, size=size.small, tooltip=_obTip)
+            if showVolInfo
+                obVBoxB = box.new(obLastSwingLowBar, _obBBoxTop, _obBRight, obZL,       bgcolor=_obBgB, border_color=color.new(color.white,100))
+                obVBoxS = box.new(obLastSwingLowBar, obZH,       _obSRight, _obSBoxBot, bgcolor=_obBgS, border_color=color.new(color.white,100))
+                array.unshift(obBullVolBoxB, obVBoxB)
+                array.unshift(obBullVolBoxS, obVBoxS)
+                array.unshift(obBullVolPct, _obBuyPct)
+            array.unshift(obBullBoxes, b)
+            array.unshift(obBullHighs, obZH)
+            array.unshift(obBullLows, obZL)
+            array.unshift(obBullBars, obLastSwingLowBar)
+            array.unshift(obBullLbls, lbl)
+            array.unshift(obBullMit, false)
+            array.unshift(obBullVolTxt, _obCombVolTxt)
+            array.unshift(obBullPctLblB, obPctLbl)
+            if array.size(obBullBoxes) > 8
+                box.delete(array.pop(obBullBoxes))
+                label.delete(array.pop(obBullLbls))
+                array.pop(obBullHighs)
+                array.pop(obBullLows)
+                array.pop(obBullBars)
+                array.pop(obBullMit)
+                array.pop(obBullVolTxt)
+                if showVolInfo
+                    box.delete(array.pop(obBullVolBoxB)), box.delete(array.pop(obBullVolBoxS))
+                    array.pop(obBullVolPct)
+                label.delete(array.pop(obBullPctLblB))
+            obLastBullEvent := bar_index
+
+
+// ─────────────────────────────────────────────────────────────
+// BLOCK B — BEAR
+// ─────────────────────────────────────────────────────────────
+if showOBZones and obBearStructBreak and not na(obLastSwingHigh) and not na(obLastSwingHighBar)
+    obIdx = bar_index - obLastSwingHighBar
+    if obIdx >= 0 and obIdx < 500
+        obZH = math.max(open[obIdx],close[obIdx]), obZL = math.min(open[obIdx],close[obIdx])
+        if obZH - obZL < _atrQZMin
+            obZH := high[obIdx], obZL := low[obIdx]
+        _obSz     = obZH - obZL
+        _obSizeOK = atrOnlyMode ? (_obSz >= _atrMinOB and _obSz <= _atrMaxOB) : (_obSz >= _atrMinOB and _obSz <= _atrMaxOB and _obSz >= effMinOBPts and _obSz <= effMaxOBPts)
+        if _obSizeOK and not f_obMergeBear(obZH,obZL,obLastSwingHighBar)
+            [_obRv, _obRsv, _obRcnt] = f_zoneVol(obZH, obZL)
+            _obRTotal     = _obRv + _obRsv
+            _obRBuyPct    = _obRTotal > 0 ? _obRv / _obRTotal : 0.5
+            _obRSellPct   = 1.0 - _obRBuyPct
+            _obRRsk       = showVolInfo and _obRcnt > 0 ? f_volRisk(_obRv, _obRsv, _obRcnt) : ""
+            _obRStrength  = _obRRsk == "LOW RISK" ? "MTL STRONG RESISTANCE" : _obRRsk == "MED RISK" ? "MTL MODERATE RESISTANCE" : _obRRsk == "HIGH RISK" ? "MTL WEAK RESISTANCE" : "MTL RESISTANCE"
+            _obRZoneHt    = obZH - obZL
+            _obRBgB = showVolInfo ? color.new(#00C853, 40) : color.new(color.white, 100)
+            _obRBgS = showVolInfo ? color.new(#FF1744, 40) : color.new(color.white, 100)
+            _obRBPctTxt = showVolInfo ? str.tostring(math.round(_obRBuyPct  * 100)) + "%" : ""
+            _obRSPctTxt = showVolInfo ? str.tostring(math.round(_obRSellPct * 100)) + "%" : ""
+            _obRBBoxTop = obZL + _obRZoneHt * _obRBuyPct
+            _obRSBoxBot = _obRBBoxTop
+            _obRBRight  = obLastSwingHighBar + math.round((bar_index + zoneExtend - obLastSwingHighBar) * _obRBuyPct)
+            _obRSRight  = obLastSwingHighBar + math.round((bar_index + zoneExtend - obLastSwingHighBar) * _obRSellPct)
+            _obRMid        = (obZH + obZL) / 2
+            _obRCombVolTxt = showVolInfo ? _obRBPctTxt + " B | " + _obRSPctTxt + " S\n" + _obRStrength : ""
+            _obRTip = "OB Bear\nH: " + str.tostring(obZH, format.mintick) + "  L: " + str.tostring(obZL, format.mintick) + (showVolInfo ? "\n" + _obRCombVolTxt : "")
+            b        = box.new(obLastSwingHighBar, obZH, bar_index+zoneExtend, obZL, bgcolor=color.new(#c62828,93), border_color=#7f0000, border_width=2)
+            obRPctLbl = showVolInfo ? label.new(bar_index, _obRMid, _obRCombVolTxt, style=label.style_none, color=color.new(color.black,100), textcolor=color.white, size=size.normal, textalign=text.align_right) : na
+            lbl = label.new(obLastSwingHighBar,obZH, showOBLabels and not cleanMode ? "✦ MTL Sell" : "", style=showOBLabels and not cleanMode ? label.style_label_down : label.style_none, color=obBearColor, textcolor=color.white, size=size.small, tooltip=_obRTip)
+            if showVolInfo
+                obRVBoxB = box.new(obLastSwingHighBar, _obRBBoxTop, _obRBRight, obZL,       bgcolor=_obRBgB, border_color=color.new(color.white,100))
+                obRVBoxS = box.new(obLastSwingHighBar, obZH,        _obRSRight, _obRSBoxBot, bgcolor=_obRBgS, border_color=color.new(color.white,100))
+                array.unshift(obBearVolBoxB,obRVBoxB), array.unshift(obBearVolBoxS,obRVBoxS)
+                array.unshift(obBearVolPct, _obRBuyPct)
+            array.unshift(obBearBoxes,b)
+            array.unshift(obBearHighs,obZH), array.unshift(obBearLows,obZL)
+            array.unshift(obBearBars,obLastSwingHighBar)
+            array.unshift(obBearLbls,lbl), array.unshift(obBearMit,false)
+            array.unshift(obBearVolTxt,_obRCombVolTxt)
+            array.unshift(obBearPctLblB,obRPctLbl)
+            if array.size(obBearBoxes) > 8
+                box.delete(array.pop(obBearBoxes)), label.delete(array.pop(obBearLbls))
+                array.pop(obBearHighs), array.pop(obBearLows), array.pop(obBearBars), array.pop(obBearMit)
+                array.pop(obBearVolTxt)
+                if showVolInfo
+                    box.delete(array.pop(obBearVolBoxB)), box.delete(array.pop(obBearVolBoxS))
+                    array.pop(obBearVolPct)
+                label.delete(array.pop(obBearPctLblB))
+            obLastBearEvent := bar_index
+
+// ═══════════════════════════════════════════════════════════════
+// OB UPDATE LOOP — BULL
+// ═══════════════════════════════════════════════════════════════
+if array.size(obBullBoxes) > 0 and (barstate.isconfirmed or barstate.islast)
+    ii = 0
+    while ii < array.size(obBullBoxes)
+        oH = array.get(obBullHighs,ii), oL = array.get(obBullLows,ii)
+        mitigated = obMitigation == "Wick" ? low <= oL : close <= oL
+        if mitigated
+            box.delete(array.get(obBullBoxes,ii)), label.delete(array.get(obBullLbls,ii))
+            if showVolInfo
+                box.delete(array.get(obBullVolBoxB,ii)), box.delete(array.get(obBullVolBoxS,ii))
+            label.delete(array.get(obBullPctLblB,ii))
+            array.remove(obBullBoxes,ii), array.remove(obBullHighs,ii)
+            array.remove(obBullLows,ii),  array.remove(obBullBars,ii)
+            array.remove(obBullLbls,ii),  array.remove(obBullMit,ii)
+            array.remove(obBullVolTxt,ii)
+            if showVolInfo
+                array.remove(obBullVolBoxB,ii), array.remove(obBullVolBoxS,ii)
+                array.remove(obBullVolPct,ii)
+            array.remove(obBullPctLblB,ii)
+        else
+            if barstate.isconfirmed or barstate.islast
+                box.set_right(array.get(obBullBoxes,ii), bar_index+zoneExtend)
+                if showVolInfo
+                    _obLBar   = array.get(obBullBars,ii)
+                    _obBwPct  = array.get(obBullVolPct,ii)
+                    _obBSplit = _obLBar + math.round((bar_index + zoneExtend - _obLBar) * _obBwPct)
+                    _obSSplit = _obLBar + math.round((bar_index + zoneExtend - _obLBar) * (1.0 - _obBwPct))
+                    box.set_right(array.get(obBullVolBoxB,ii), _obBSplit)
+                    box.set_right(array.get(obBullVolBoxS,ii), _obSSplit)
+                    label.set_x(array.get(obBullPctLblB,ii), bar_index)
+                    label.set_y(array.get(obBullPctLblB,ii), (oH+oL)/2)
+            box.set_border_color(array.get(obBullBoxes,ii), #1B5E20)
+            box.set_border_width(array.get(obBullBoxes,ii), 2)
+            if showOBLabels and not cleanMode
+                label.set_text(array.get(obBullLbls,ii), "✦ MTL Buy")
+            obBullPriceIn = low <= oH and high >= oL
+            alreadyFired  = array.get(obBullMit,ii)
+            if pcAlertOB and obBullPriceIn and not alreadyFired and barstate.isconfirmed
+                if close > oL and trendBuyOK
+                    sig_ob_buy := true
+                    array.set(obBullMit,ii,true)
+            if not obBullPriceIn and alreadyFired
+                array.set(obBullMit,ii,false)
+            ii += 1
+
+// ═══════════════════════════════════════════════════════════════
+// OB UPDATE LOOP — BEAR
+// ═══════════════════════════════════════════════════════════════
+if array.size(obBearBoxes) > 0 and (barstate.isconfirmed or barstate.islast)
+    ii = 0
+    while ii < array.size(obBearBoxes)
+        oH = array.get(obBearHighs,ii), oL = array.get(obBearLows,ii)
+        mitigated = obMitigation == "Wick" ? high >= oH : close >= oH
+        if mitigated
+            box.delete(array.get(obBearBoxes,ii)), label.delete(array.get(obBearLbls,ii))
+            if showVolInfo
+                box.delete(array.get(obBearVolBoxB,ii)), box.delete(array.get(obBearVolBoxS,ii))
+            label.delete(array.get(obBearPctLblB,ii))
+            array.remove(obBearBoxes,ii), array.remove(obBearHighs,ii)
+            array.remove(obBearLows,ii),  array.remove(obBearBars,ii)
+            array.remove(obBearLbls,ii),  array.remove(obBearMit,ii)
+            array.remove(obBearVolTxt,ii)
+            if showVolInfo
+                array.remove(obBearVolBoxB,ii), array.remove(obBearVolBoxS,ii)
+                array.remove(obBearVolPct,ii)
+            array.remove(obBearPctLblB,ii)
+        else
+            if barstate.isconfirmed or barstate.islast
+                box.set_right(array.get(obBearBoxes,ii), bar_index+zoneExtend)
+                if showVolInfo
+                    _obRLBar  = array.get(obBearBars,ii)
+                    _obRBwPct = array.get(obBearVolPct,ii)
+                    _obRBSplit = _obRLBar + math.round((bar_index + zoneExtend - _obRLBar) * _obRBwPct)
+                    _obRSSplit = _obRLBar + math.round((bar_index + zoneExtend - _obRLBar) * (1.0 - _obRBwPct))
+                    box.set_right(array.get(obBearVolBoxB,ii), _obRBSplit)
+                    box.set_right(array.get(obBearVolBoxS,ii), _obRSSplit)
+                    label.set_x(array.get(obBearPctLblB,ii), bar_index)
+                    label.set_y(array.get(obBearPctLblB,ii), (oH+oL)/2)
+            box.set_border_color(array.get(obBearBoxes,ii), #7f0000)
+            box.set_border_width(array.get(obBearBoxes,ii), 2)
+            if showOBLabels and not cleanMode
+                label.set_text(array.get(obBearLbls,ii), "✦ MTL Sell")
+            obBearPriceIn = low <= oH and high >= oL
+            alreadyFiredB = array.get(obBearMit,ii)
+            if pcAlertOB and obBearPriceIn and not alreadyFiredB and barstate.isconfirmed
+                if close < oH and trendSellOK
+                    sig_ob_sell := true
+                    array.set(obBearMit,ii,true)
+            if not obBearPriceIn and alreadyFiredB
+                array.set(obBearMit,ii,false)
+            ii += 1
+
+// ═══════════════════════════════════════════════════════════════
+// CONFLUENCE CACHE UPDATE
+// ═══════════════════════════════════════════════════════════════
+if newBullFVGThisBar and barstate.isconfirmed
+    szB = array.size(qzBullBoxes)
+    if szB > 0
+        for k = 0 to szB-1
+            newConf = f_checkBullConf(array.get(qzBullHighs,k),array.get(qzBullLows,k))
+            array.set(qzBullConf,k,newConf)
+            f_applyBullConf(k,newConf)
+
+if newBearFVGThisBar and barstate.isconfirmed
+    szR = array.size(qzBearBoxes)
+    if szR > 0
+        for k = 0 to szR-1
+            newConf = f_checkBearConf(array.get(qzBearHighs,k),array.get(qzBearLows,k))
+            array.set(qzBearConf,k,newConf)
+            f_applyBearConf(k,newConf)
+
+// ═══════════════════════════════════════════════════════════════
+// QZONE UPDATE LOOP — BULL
+// ═══════════════════════════════════════════════════════════════
+mzTouchWindow = isLowTF ? 3 : 6
+_qzRunFull = barstate.isconfirmed or barstate.islast
+
+if array.size(qzBullBoxes) > 0 and _qzRunFull
+    i = 0
+    while i < array.size(qzBullBoxes)
+        zH = array.get(qzBullHighs,i), zL = array.get(qzBullLows,i)
+        zBar = array.get(qzBullBars,i), sc = array.get(qzBullScore,i)
+        wasIn = array.get(qzBullInZone,i)
+        bodyHigh = math.max(open,close), bodyLow = math.min(open,close)
+        priceIn  = bodyLow <= zH and bodyHigh >= zL
+
+        if priceIn and not wasIn
+            if isM1TF
+                prevBodyLow = math.min(open[1],close[1])
+                array.set(qzBullApproachOK,i, prevBodyLow > zH)
+            else
+                array.set(qzBullApproachOK,i,true)
+
+        if not priceIn and wasIn and close > zH
+            array.set(qzBullApproachOK,i,false)
+
+        if priceIn
+            array.set(qzBullLastTouch,i,bar_index)
+
+        if priceIn and not wasIn
+            newTouch = array.get(qzBullTouch,i) + 1
+            array.set(qzBullTouch,i,newTouch)
+
+        if barstate.isconfirmed
+            alreadyConfirmed = array.get(qzBullConfirmed,i)
+            if not alreadyConfirmed
+                lastTouch = array.get(qzBullLastTouch,i)
+                hadTouch  = lastTouch > -999
+                if hadTouch and not priceIn and close > zH
+                    array.set(qzBullConfirmed,i,true)
+            else
+                if priceIn
+                    array.set(qzBullConfirmed,i,false)
+
+        if array.get(qzBullQShown,i) and not priceIn and not wasIn and close > zH
+            array.set(qzBullQShown,i,false)
+
+        array.set(qzBullInZone,i,priceIn)
+
+        if not priceIn
+            hasConf = array.get(qzBullConf,i)
+            box.set_border_color(array.get(qzBullBoxes,i), hasConf ? confBorderColor : #1B5E20)
+            box.set_border_width(array.get(qzBullBoxes,i), hasConf ? 3 : 2)
+            if array.size(obBullBoxes) > 0
+                for _oi = 0 to array.size(obBullBoxes)-1
+                    if array.get(obBullHighs,_oi) >= zL and array.get(obBullLows,_oi) <= zH
+                        box.set_border_color(array.get(qzBullBoxes,i), color.lime)
+                        box.set_border_width(array.get(qzBullBoxes,i), 4)
+                        break
+
+        if showQLabels and not cleanMode
+            _uls = sc >= 3 ? " ●●●" : sc >= 2 ? " ●●" : " ●"
+            label.set_text(array.get(qzBullCrtLbls,i), "✦ MTL Buy" + _uls)
+        if showVolInfo and not cleanMode
+            label.set_text(array.get(qzBullLbls,i), array.get(qzBullVolTxt,i))
+
+        if barstate.isconfirmed or barstate.islast
+            zMid       = (zH+zL)/2
+            age        = bar_index - zBar
+            lastTouch  = array.get(qzBullLastTouch,i)
+            approachOK = array.get(qzBullApproachOK,i)
+            confirmed  = array.get(qzBullConfirmed,i)
+            recentTouch = lastTouch >= 0 and (bar_index - lastTouch) <= mzTouchWindow
+            touchedZone = recentTouch or (not isLowTF and low <= zH and recentTouch)
+
+
+// ─── BLOCK A — BULL ──────────────────────────────────────────
+            if showQLabels and not array.get(qzBullQShown,i)
+                confirmOK = requireConfirm ? confirmed : touchedZone
+                if confirmOK and approachOK and math.max(open,close) > zH and close > zH and (close-zH) >= mzLabelMinDist
+                    f_fireMZBuy(array.get(qzBullQLbls,i), low)
+                    array.set(qzBullQShown,i,true)
+                    if pcAlertQZ and trendBuyOK
+                        sig_qz_buy := true
+                        lastBuySrc := array.get(qzBullSrc, i)
+
+
+            if qDeleteOnBreak and close < zL
+                label.delete(array.get(qzBullQLbls,i)),   label.delete(array.get(qzBullLbls,i))
+                label.delete(array.get(qzBullCrtLbls,i)), box.delete(array.get(qzBullBoxes,i))
+                if showVolInfo
+                    box.delete(array.get(qzBullVolBoxB,i))
+                    box.delete(array.get(qzBullVolBoxS,i))
+                array.remove(qzBullBoxes,i),       array.remove(qzBullHighs,i),     array.remove(qzBullLows,i)
+                array.remove(qzBullBars,i),        array.remove(qzBullScore,i),     array.remove(qzBullTouch,i)
+                array.remove(qzBullLastTouch,i),   array.remove(qzBullInZone,i)
+                array.remove(qzBullApproachOK,i),  array.remove(qzBullConfirmed,i)
+                array.remove(qzBullQShown,i),      array.remove(qzBullFaded,i)
+                array.remove(qzBullLbls,i),        array.remove(qzBullQLbls,i),     array.remove(qzBullCrtLbls,i)
+                array.remove(qzBullSrc,i),         array.remove(qzBullConf,i)
+                array.remove(qzBullVolTxt,i)
+                if showVolInfo
+                    array.remove(qzBullVolBoxB,i)
+                    array.remove(qzBullVolBoxS,i)
+                    array.remove(qzBullVolPct,i)
+                continue
+
+            if not array.get(qzBullFaded,i) and close <= zH and close >= zL
+                box.set_border_color(array.get(qzBullBoxes,i), color.new(#1B5E20,40))
+                array.set(qzBullFaded,i,true)
+
+            if engAgeFade and age > effFadeAfter
+                _ageOver  = age - effFadeAfter
+                _fadeStep = math.min(6, _ageOver / effFadeAfter * 6)
+                box.set_bgcolor(array.get(qzBullBoxes,i), color.new(#00C853, 93 + math.round(_fadeStep)))
+
+            box.set_right(array.get(qzBullBoxes,i), bar_index+zoneExtend)
+            if showVolInfo
+                _bwPct  = array.get(qzBullVolPct, i)
+                _bSplit = zBar + math.round((bar_index + zoneExtend - zBar) * _bwPct)
+                _sSplit = zBar + math.round((bar_index + zoneExtend - zBar) * (1.0 - _bwPct))
+                box.set_right(array.get(qzBullVolBoxB,i), _bSplit)
+                box.set_right(array.get(qzBullVolBoxS,i), _sSplit)
+                label.set_x(array.get(qzBullLbls,i), bar_index)
+                label.set_y(array.get(qzBullLbls,i), zMid)
+        i += 1
+
+// ═══════════════════════════════════════════════════════════════
+// QZONE UPDATE LOOP — BEAR
+// ═══════════════════════════════════════════════════════════════
+if array.size(qzBearBoxes) > 0 and _qzRunFull
+    i = 0
+    while i < array.size(qzBearBoxes)
+        zH = array.get(qzBearHighs,i), zL = array.get(qzBearLows,i)
+        zBar = array.get(qzBearBars,i), sc = array.get(qzBearScore,i)
+        wasIn = array.get(qzBearInZone,i)
+        bodyHigh = math.max(open,close), bodyLow = math.min(open,close)
+        priceIn  = bodyLow <= zH and bodyHigh >= zL
+
+        if priceIn and not wasIn
+            if isM1TF
+                prevBodyHigh = math.max(open[1],close[1])
+                array.set(qzBearApproachOK,i, prevBodyHigh < zL)
+            else
+                array.set(qzBearApproachOK,i,true)
+        if not priceIn and wasIn and close < zL
+            array.set(qzBearApproachOK,i,false)
+
+        if priceIn
+            array.set(qzBearLastTouch,i,bar_index)
+
+        if priceIn and not wasIn
+            newTouch = array.get(qzBearTouch,i) + 1
+            array.set(qzBearTouch,i,newTouch)
+
+        if barstate.isconfirmed
+            alreadyConfirmed = array.get(qzBearConfirmed,i)
+            if not alreadyConfirmed
+                lastTouch = array.get(qzBearLastTouch,i)
+                hadTouch  = lastTouch > -999
+                if hadTouch and not priceIn and close < zL
+                    array.set(qzBearConfirmed,i,true)
+            else
+                if priceIn
+                    array.set(qzBearConfirmed,i,false)
+
+        if array.get(qzBearQShown,i) and not priceIn and not wasIn and close < zL
+            array.set(qzBearQShown,i,false)
+
+        array.set(qzBearInZone,i,priceIn)
+
+        if not priceIn
+            hasConf = array.get(qzBearConf,i)
+            box.set_border_color(array.get(qzBearBoxes,i), hasConf ? confBorderColor : #7f0000)
+            box.set_border_width(array.get(qzBearBoxes,i), hasConf ? 3 : 2)
+            if array.size(obBearBoxes) > 0
+                for _oi = 0 to array.size(obBearBoxes)-1
+                    if array.get(obBearHighs,_oi) >= zL and array.get(obBearLows,_oi) <= zH
+                        box.set_border_color(array.get(qzBearBoxes,i), color.red)
+                        box.set_border_width(array.get(qzBearBoxes,i), 4)
+                        break
+
+        if showQLabels and not cleanMode
+            _buls = sc >= 3 ? " ●●●" : sc >= 2 ? " ●●" : " ●"
+            label.set_text(array.get(qzBearCrtLbls,i), "✦ MTL Sell" + _buls)
+        if showVolInfo and not cleanMode
+            label.set_text(array.get(qzBearLbls,i), array.get(qzBearVolTxt,i))
+
+        if barstate.isconfirmed or barstate.islast
+            zMid       = (zH+zL)/2
+            age        = bar_index - zBar
+            lastTouch  = array.get(qzBearLastTouch,i)
+            approachOK = array.get(qzBearApproachOK,i)
+            confirmed  = array.get(qzBearConfirmed,i)
+            recentTouch = lastTouch >= 0 and (bar_index - lastTouch) <= mzTouchWindow
+            touchedZone = recentTouch or (not isLowTF and high >= zL and recentTouch)
+
+           // ─── BLOCK B — BEAR ──────────────────────────────────────────
+            if showQLabels and not array.get(qzBearQShown,i)
+                confirmOK = requireConfirm ? confirmed : touchedZone
+                if confirmOK and approachOK and math.min(open,close) < zL and close < zL and (zL-close) >= mzLabelMinDist
+                    f_fireMZSell(array.get(qzBearQLbls,i), high)
+                    array.set(qzBearQShown,i,true)
+                    if pcAlertQZ and trendSellOK
+                        sig_qz_sell := true
+                        lastSellSrc := array.get(qzBearSrc, i)
+
+            if qDeleteOnBreak and close > zH
+                label.delete(array.get(qzBearQLbls,i)),   label.delete(array.get(qzBearLbls,i))
+                label.delete(array.get(qzBearCrtLbls,i)), box.delete(array.get(qzBearBoxes,i))
+                if showVolInfo
+                    box.delete(array.get(qzBearVolBoxB,i))
+                    box.delete(array.get(qzBearVolBoxS,i))
+                array.remove(qzBearBoxes,i),       array.remove(qzBearHighs,i),     array.remove(qzBearLows,i)
+                array.remove(qzBearBars,i),        array.remove(qzBearScore,i),     array.remove(qzBearTouch,i)
+                array.remove(qzBearLastTouch,i),   array.remove(qzBearInZone,i)
+                array.remove(qzBearApproachOK,i),  array.remove(qzBearConfirmed,i)
+                array.remove(qzBearQShown,i),      array.remove(qzBearFaded,i)
+                array.remove(qzBearLbls,i),        array.remove(qzBearQLbls,i),     array.remove(qzBearCrtLbls,i)
+                array.remove(qzBearSrc,i),         array.remove(qzBearConf,i)
+                array.remove(qzBearVolTxt,i)
+                if showVolInfo
+                    array.remove(qzBearVolBoxB,i)
+                    array.remove(qzBearVolBoxS,i)
+                    array.remove(qzBearVolPct,i)
+                continue
+
+            if not array.get(qzBearFaded,i) and close >= zL and close <= zH
+                box.set_border_color(array.get(qzBearBoxes,i), color.new(#7f0000,50))
+                array.set(qzBearFaded,i,true)
+
+            if engAgeFade and age > effFadeAfter
+                _rAgeOver  = age - effFadeAfter
+                _rFadeStep = math.min(6, _rAgeOver / effFadeAfter * 6)
+                box.set_bgcolor(array.get(qzBearBoxes,i), color.new(#c62828, 93 + math.round(_rFadeStep)))
+
+            box.set_right(array.get(qzBearBoxes,i), bar_index+zoneExtend)
+            if showVolInfo
+                _rbwPct  = array.get(qzBearVolPct, i)
+                _rbSplit = zBar + math.round((bar_index + zoneExtend - zBar) * _rbwPct)
+                _rsSplit = zBar + math.round((bar_index + zoneExtend - zBar) * (1.0 - _rbwPct))
+                box.set_right(array.get(qzBearVolBoxB,i), _rbSplit)
+                box.set_right(array.get(qzBearVolBoxS,i), _rsSplit)
+                label.set_x(array.get(qzBearLbls,i), bar_index)
+                label.set_y(array.get(qzBearLbls,i), zMid)
+        i += 1
+
+// ═══════════════════════════════════════════════════════════════
+// PIVOTS + PDH/PDL
+// ═══════════════════════════════════════════════════════════════
+pdh = request.security(syminfo.tickerid,"D",high[1], lookahead=barmerge.lookahead_off)
+pdl = request.security(syminfo.tickerid,"D",low[1],  lookahead=barmerge.lookahead_off)
+pdc = request.security(syminfo.tickerid,"D",close[1],lookahead=barmerge.lookahead_off)
+isNewDay = ta.change(time("D")) != 0
+PP = (pdh+pdl+pdc)/3
+R1 = 2*PP-pdl, R2 = PP+(pdh-pdl)
+S1 = 2*PP-pdh, S2 = PP-(pdh-pdl)
+var line lR1=na, var line lR2=na, var line lS1=na, var line lS2=na
+var label lblR1=na, var label lblR2=na, var label lblS1=na, var label lblS2=na
+var line  keyLine=na, var label keyLabel=na
+if isNewDay
+    if showPivots
+        line.delete(lR1), line.delete(lR2), line.delete(lS1), line.delete(lS2)
+        label.delete(lblR1), label.delete(lblR2), label.delete(lblS1), label.delete(lblS2)
+        lR1 := line.new(bar_index,R1,bar_index+1,R1,color=ePivot,width=2,extend=extend.right)
+        lR2 := line.new(bar_index,R2,bar_index+1,R2,color=ePivot,width=2,extend=extend.right)
+        lS1 := line.new(bar_index,S1,bar_index+1,S1,color=ePivot,width=2,extend=extend.right)
+        lS2 := line.new(bar_index,S2,bar_index+1,S2,color=ePivot,width=2,extend=extend.right)
+        lblR1 := label.new(bar_index,R1,"R1  "+str.tostring(math.round(R1,2)),style=label.style_label_right,color=color.new(ePivot,80),textcolor=ePivot,size=size.normal)
+        lblR2 := label.new(bar_index,R2,"R2  "+str.tostring(math.round(R2,2)),style=label.style_label_right,color=color.new(ePivot,80),textcolor=ePivot,size=size.normal)
+        lblS1 := label.new(bar_index,S1,"S1  "+str.tostring(math.round(S1,2)),style=label.style_label_right,color=color.new(ePivot,80),textcolor=ePivot,size=size.normal)
+        lblS2 := label.new(bar_index,S2,"S2  "+str.tostring(math.round(S2,2)),style=label.style_label_right,color=color.new(ePivot,80),textcolor=ePivot,size=size.normal)
+    if showKeyLevel
+        line.delete(keyLine), label.delete(keyLabel)
+        keyLine  := line.new(bar_index,PP,bar_index+1,PP,color=ePivot,width=2,style=line.style_solid,extend=extend.right)
+        keyLabel := label.new(bar_index,PP,"Key  "+str.tostring(math.round(PP,2)),style=label.style_label_right,color=color.new(ePivot,80),textcolor=ePivot,size=size.normal)
+
+// Keep pivot labels pinned to the right edge as new bars print
+if barstate.islast
+    if showPivots and not na(lblR1)
+        label.set_x(lblR1, bar_index), label.set_x(lblR2, bar_index)
+        label.set_x(lblS1, bar_index), label.set_x(lblS2, bar_index)
+    if showKeyLevel and not na(keyLabel)
+        label.set_x(keyLabel, bar_index)
+
+// ═══════════════════════════════════════════════════════════════
+// SIDEWAYS DETECTION
+// ═══════════════════════════════════════════════════════════════
+swEffLookback = isM1TF ? math.max(swLookback,20) : isM5TF ? math.max(swLookback,40) : isM15TF ? math.max(swLookback,35) : isM30TF ? math.max(swLookback,30) : isH1TF ? math.max(swLookback,24) : isH4TF ? math.max(swLookback,20) : swLookback
+swEffAtrMult  = isM1TF ? swAtrMult*0.6 : isM5TF ? swAtrMult*1.0 : isM15TF ? swAtrMult*1.3 : isM30TF ? swAtrMult*1.6 : isH1TF ? swAtrMult*2.0 : isH4TF ? swAtrMult*2.5 : swAtrMult
+swEffSlope    = isM1TF ? swSlopeThresh*0.6 : isM5TF ? swSlopeThresh*1.0 : isM15TF ? swSlopeThresh*1.4 : isM30TF ? swSlopeThresh*1.8 : isH1TF ? swSlopeThresh*2.5 : isH4TF ? swSlopeThresh*3.5 : swSlopeThresh
+swEffMinBars  = isM1TF ? math.max(swMinBars,10) : isM5TF ? math.max(swMinBars,5) : isM15TF ? math.max(swMinBars,4) : isM30TF ? math.max(swMinBars,3) : isH1TF ? math.max(swMinBars,3) : isH4TF ? math.max(swMinBars,3) : swMinBars
+
+swHighest = ta.highest(high,swEffLookback)
+swLowest  = ta.lowest (low, swEffLookback)
+swRange   = swHighest - swLowest
+
+_swLinregNow  = ta.linreg(close, swEffLookback, 0)
+_swLinregPrev = ta.linreg(close, swEffLookback, swEffLookback - 1)
+var float swSlopeNorm = 0.0
+if swRunThisBar
+    swSlopeRaw  = math.abs(_swLinregNow - _swLinregPrev) / swEffLookback
+    swSlopeNorm := atrValue > 0 ? swSlopeRaw / atrValue : 0.0
+
+swRangeCond = swRange <= atrValue * swEffAtrMult
+swSlopeCond = swSlopeNorm < swEffSlope
+swBothCond  = swRangeCond and swSlopeCond
+
+var bool swIsActive   = false
+var int  swConsecCount = 0
+var int   swStartBar = na
+var float swZoneHigh = na, var float swZoneLow  = na
+var line  swLineH    = na, var line  swLineL    = na
+var label swLbl      = na
+
+swHardBreak = not na(swZoneHigh) and not na(swZoneLow) and
+     barstate.isconfirmed and (close > swZoneHigh or close < swZoneLow)
+
+swConsecCount := (swBothCond and not swHardBreak) ? swConsecCount + 1 : 0
+bool isSideways = showSideways and swConsecCount >= swEffMinBars
+
+swJustStarted = isSideways and not swIsActive
+swJustEnded   = not isSideways and swIsActive
+
+if swJustStarted
+    swStartBar := bar_index - swEffLookback + 1
+    swZoneHigh := swHighest, swZoneLow := swLowest
+
+if swJustEnded and not na(swStartBar)
+    line.delete(swLineH), line.delete(swLineL), label.delete(swLbl)
+    swLineH := na, swLineL := na, swLbl := na
+    swStartBar := na, swZoneHigh := na, swZoneLow := na
+
+if isSideways and not na(swStartBar)
+    swSize = swZoneHigh - swZoneLow
+    if swShowLines
+        line.delete(swLineH), line.delete(swLineL)
+        swLineH := line.new(swStartBar,swZoneHigh,bar_index+60,swZoneHigh, color=swLineColor,width=2,style=line.style_dashed,extend=extend.none)
+        swLineL := line.new(swStartBar,swZoneLow, bar_index+60,swZoneLow,  color=swLineColor,width=2,style=line.style_dashed,extend=extend.none)
+    if swShowLabel
+        label.delete(swLbl)
+        swLbl := label.new(swStartBar,swZoneHigh, "↔ SIDEWAYS  "+str.tostring(math.round(swSize,2))+" pts",
+             style=label.style_none, color=color.new(swLineColor,100), textcolor=swLabelColor, size=size.small)
+
+swIsActive := isSideways
+
+// ═══════════════════════════════════════════════════════════════
+// PINECONNECTOR ALERT OUTPUT
+// ═══════════════════════════════════════════════════════════════
+_pcFreq = pcFreq == "Once Per Bar Close" ? alert.freq_once_per_bar_close :
+          pcFreq == "Once Per Bar"       ? alert.freq_once_per_bar       :
+          alert.freq_all
+
+sidewaysBlock = blockSideways and isSideways
+
+_buyCount  = (sig_qz_buy  ? 1 : 0) + (sig_ob_buy  ? 1 : 0) + (sig_mz_buy  ? 1 : 0) + (sig_fvg_buy  ? 1 : 0)
+_sellCount = (sig_qz_sell ? 1 : 0) + (sig_ob_sell ? 1 : 0) + (sig_mz_sell ? 1 : 0) + (sig_fvg_sell ? 1 : 0)
+_contested = blockOpposite and (_buyCount >= 1 and _sellCount >= 1)
+
+anyBuy  = _buyCount  >= minSources and not _contested and not sidewaysBlock and trendBuyOK
+anySell = _sellCount >= minSources and not _contested and not sidewaysBlock and trendSellOK
+
+_withTrendBuy  = not useHTFBias or htfBullBias
+_withTrendSell = not useHTFBias or htfBearBias
+
+_spread   = pcSpread > 0 ? ",spread=" + str.tostring(pcSpread) : ""
+
+_trailTF  = timeframe.period
+_trailStr = pcTrailATR ?
+     ",atrtimeframe=" + _trailTF +
+     ",atrperiod="    + str.tostring(pcTrailPer) +
+     ",atrmultiplier="+ str.tostring(pcTrailMult) +
+     (pcTrailTrig > 0 ? ",atrtrigger=" + str.tostring(pcTrailTrig) : "") : ""
+
+_beStr = useBreakeven ?
+     ",betrigger=" + str.tostring(_beTrigger) +
+     ",bestop="    + str.tostring(beStopPips) : ""
+
+_newsStr = useNewsFilter ? ",newsfilter=1" : ""
+
+_pcStr = usePartialClose ?
+     ",closepart=50,closetrigger=" + str.tostring(math.round(_pcSL, 1)) : ""
+
+_baseRiskBuy  = (useHTFBias and htfMode == "Soft" and not htfBullBias) ? htfCounterRisk : pcRisk
+_baseRiskSell = (useHTFBias and htfMode == "Soft" and not htfBearBias) ? htfCounterRisk : pcRisk
+
+// ── ML zone tagging (sends zone + confluence to Python relay) ─
+_qzBuyTag  = lastBuySrc  == "MZ" ? "MZ" : lastBuySrc  == "BZ" ? "Base" : "QZone"
+_qzSellTag = lastSellSrc == "MZ" ? "MZ" : lastSellSrc == "BZ" ? "Base" : "QZone"
+
+_buyZone  = sig_ob_buy  ? "OB" : sig_qz_buy  ? _qzBuyTag  : sig_fvg_buy  ? "FVG" : "UNKNOWN"
+_sellZone = sig_ob_sell ? "OB" : sig_qz_sell ? _qzSellTag : sig_fvg_sell ? "FVG" : "UNKNOWN"
+_buyConf  = str.tostring(math.min(_buyCount,  4))
+_sellConf = str.tostring(math.min(_sellCount, 4))
+
+if anyBuy and barstate.isconfirmed
+    if mgResetOnFlip and mg_last_was_sell
+        mg_buy_entry  := na
+        mg_buy_sl     := na
+        mg_buy_layers := 0
+        mg_buy_level  := 0
+    mg_buy_entry    := close
+    mg_buy_sl       := close - (_pcSL / _pcPipMult)
+    mg_buy_layers   := 0
+    mg_buy_level    := 1
+    mg_last_was_buy  := true
+    mg_last_was_sell := false
+    if mgResetOnFlip
+        mg_sell_entry  := na
+        mg_sell_sl     := na
+        mg_sell_layers := 0
+        mg_sell_level  := 0
+
+if anySell and barstate.isconfirmed
+    if mgResetOnFlip and mg_last_was_buy
+        mg_sell_entry  := na
+        mg_sell_sl     := na
+        mg_sell_layers := 0
+        mg_sell_level  := 0
+    mg_sell_entry   := close
+    mg_sell_sl      := close + (_pcSL / _pcPipMult)
+    mg_sell_layers  := 0
+    mg_sell_level   := 1
+    mg_last_was_sell := true
+    mg_last_was_buy  := false
+    if mgResetOnFlip
+        mg_buy_entry  := na
+        mg_buy_sl     := na
+        mg_buy_layers := 0
+        mg_buy_level  := 0
+
+if useMartingale and not na(mg_buy_entry) and not na(mg_buy_sl) and barstate.isconfirmed
+    _slDist = mg_buy_entry - mg_buy_sl
+    if _slDist > 0 and mg_buy_layers < mgMaxLevel and not anyBuy
+        _nextLayer  = mg_buy_layers + 1
+        _layerPrice = mg_buy_entry - (_slDist * mgLayerSpacing * _nextLayer)
+        if close <= _layerPrice and close > mg_buy_sl
+            _layerRisk = math.round(_baseRiskBuy * math.pow(mgMultiplier, _nextLayer), 2)
+            _layerSL   = math.round((close - mg_buy_sl) * _pcPipMult, 1)
+            _layerSL   := math.max(_layerSL, _pcMinSL)
+            alert(
+            pcLicenseID + ",buy,"  + pcSymbol  +
+             ",sl="   + str.tostring(_layerSL)         +
+             ",tp="   + str.tostring(_pcTP)             +
+          ",risk=" + str.tostring(_layerRisk)        +
+             _spread + _trailStr + _newsStr             +
+             ",zone=LAYER,conf=1",
+             alert.freq_once_per_bar_close)
+            mg_buy_layers := mg_buy_layers + 1
+            mg_buy_level  := mg_buy_level + 1
+
+if useMartingale and not na(mg_sell_entry) and not na(mg_sell_sl) and barstate.isconfirmed
+    _slDist = mg_sell_sl - mg_sell_entry
+    if _slDist > 0 and mg_sell_layers < mgMaxLevel and not anySell
+        _nextLayer  = mg_sell_layers + 1
+        _layerPrice = mg_sell_entry + (_slDist * mgLayerSpacing * _nextLayer)
+        if close >= _layerPrice and close < mg_sell_sl
+            _layerRisk = math.round(_baseRiskSell * math.pow(mgMultiplier, _nextLayer), 2)
+            _layerSL   = math.round((mg_sell_sl - close) * _pcPipMult, 1)
+            _layerSL   := math.max(_layerSL, _pcMinSL)
+            alert(
+            pcLicenseID + ",sell," + pcSymbol  +
+             ",sl="   + str.tostring(_layerSL)         +
+             ",tp="   + str.tostring(_pcTP)             +
+           ",risk=" + str.tostring(_layerRisk)        +
+             _spread + _trailStr + _newsStr             +
+             ",zone=LAYER,conf=1",
+             alert.freq_once_per_bar_close)
+            mg_sell_layers := mg_sell_layers + 1
+            mg_sell_level  := mg_sell_level + 1
+
+if not na(mg_buy_sl) and close < mg_buy_sl
+    mg_buy_entry  := na
+    mg_buy_sl     := na
+    mg_buy_layers := 0
+    mg_buy_level  := 0
+
+if not na(mg_sell_sl) and close > mg_sell_sl
+    mg_sell_entry  := na
+    mg_sell_sl     := na
+    mg_sell_layers := 0
+    mg_sell_level  := 0
+
+if anyBuy and barstate.isconfirmed
+    alert(
+     pcLicenseID + ",buy,"  + pcSymbol      +
+     ",sl="   + str.tostring(_pcSL)               +
+     ",tp="   + str.tostring(_pcTP)               +
+     ",risk=" + str.tostring(_baseRiskBuy)        +
+     _spread + _trailStr + _beStr + _pcStr + _newsStr +
+     ",zone=" + _buyZone + ",conf=" + _buyConf,
+     _pcFreq)
+
+if anySell and barstate.isconfirmed
+    alert(
+    pcLicenseID + ",sell," + pcSymbol      +
+     ",sl="   + str.tostring(_pcSL)               +
+     ",tp="   + str.tostring(_pcTP)               +
+     ",risk=" + str.tostring(_baseRiskSell)       +
+     _spread + _trailStr + _beStr + _pcStr + _newsStr +
+     ",zone=" + _sellZone + ",conf=" + _sellConf,
+     _pcFreq)
+
+alertcondition(anyBuy  and barstate.isconfirmed, "PC MTL Buy",  "{{strategy.order.alert_message}}")
+alertcondition(anySell and barstate.isconfirmed, "PC MTL Sell", "{{strategy.order.alert_message}}")
